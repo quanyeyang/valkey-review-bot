@@ -124,12 +124,24 @@ Reviewer memory: server code asserts with `serverAssert` / `debugServerAssert`. 
 Cites: PR 1502, PR 2432, PR 2472.
 Skip unless: the PR adds `#include <assert.h>`, adds `assert(` to a file whose neighbors use `serverAssert`, or places a function call that mutates state or whose return value the program depends on inside any assert macro.
 
+<!-- suppressed: superseded in 9.1.2, 2026-10-22; `emptyDB` is now `emptyData`; evidence: valkey-io/valkey@a4e5b695adaafbe65a61697bb23e9848e92f74c1:src/server.h:4034 -->
 #### `emptyDB` flags, `RDB_INCOMPATIBLE`, replication-info restore across RDB entry points
+<!-- /suppressed -->
+#### `emptyData` flags, `RDB_INCOMPATIBLE`, replication-info restore across RDB entry points
 
+<!-- suppressed: superseded in 9.1.2, 2026-10-22; `emptyDB` is now `emptyData`; evidence: valkey-io/valkey@a4e5b695adaafbe65a61697bb23e9848e92f74c1:src/debug.c:643 -->
 The diff looks OK but is wrong when: a new or modified RDB-load path calls `emptyDB(EMPTYDB_NO_FLAGS)`, treats `rdbLoad*` as returning only `C_OK` / `C_ERR`, or unconditionally calls `replicationCachePrimaryUsingMyself`.
+<!-- /suppressed -->
+The diff looks OK but is wrong when: a new or modified RDB-load path calls `emptyData(EMPTYDB_NO_FLAGS)`, treats `rdbLoad*` as returning only `C_OK` / `C_ERR`, or unconditionally calls `replicationCachePrimaryUsingMyself`.
+<!-- suppressed: superseded in 9.1.2, 2026-10-22; `emptyDB` is now `emptyData`; evidence: valkey-io/valkey@a4e5b695adaafbe65a61697bb23e9848e92f74c1:src/db.c:680 -->
 Reviewer memory: `emptyDB` must respect `lazyfree_lazy_user_flush`; `rdbLoad` / `rdbLoadRio` can return `RDB_INCOMPATIBLE` which must be propagated distinct from `RDB_FAILED`; `debug loadaof` on an existing replica must skip replication-info restore (overwriting `server.primary` releases the cached primary). A failed load must not leave the DB flushed.
+<!-- /suppressed -->
+Reviewer memory: `emptyData` must respect `lazyfree_lazy_user_flush`; `rdbLoad` / `rdbLoadRio` can return `RDB_INCOMPATIBLE` which must be propagated distinct from `RDB_FAILED`; `debug loadaof` on an existing replica must skip replication-info restore (overwriting `server.primary` releases the cached primary). A failed load must not leave the DB flushed.
 Cites: PR 1173, PR 2366, PR 2600.
+<!-- suppressed: superseded in 9.1.2, 2026-10-22; `emptyDB` is now `emptyData`; evidence: valkey-io/valkey@a4e5b695adaafbe65a61697bb23e9848e92f74c1:src/rdb.c:3728 -->
 Skip unless: the PR touches an `emptyDB(...)` call, an `rdbLoad*` caller (`replicaLoadPrimaryRDBFromSocket`, `rdbLoad`, `rdbLoadRio`, `VM_RdbLoad`, `debug.c`, `loadSingleAppendOnlyFile`), replication-info restoration, or adds a new RDB entry point.
+<!-- /suppressed -->
+Skip unless: the PR touches an `emptyData(...)` call, an `rdbLoad*` caller (`replicaLoadPrimaryRDBFromSocket`, `rdbLoad`, `rdbLoadRio`, `VM_RdbLoad`, `debug.c`, `loadSingleAppendOnlyFile`), replication-info restoration, or adds a new RDB entry point.
 
 #### TTL / expiry divergence on passive-expiry-via-overwrite
 
