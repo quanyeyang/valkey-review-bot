@@ -37,6 +37,10 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Its Lambdas run Node 24 (NODEJS_24_X), so the Node types stay on 24.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       security-and-patches:
         update-types: [minor, patch]
@@ -45,6 +49,10 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Its Lambdas run Node 24 (NODEJS_24_X), so the Node types stay on 24.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       security-and-patches:
         update-types: [minor, patch]
@@ -53,6 +61,10 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Its Lambdas run Node 24 (NODEJS_24_X), so the Node types stay on 24.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       security-and-patches:
         update-types: [minor, patch]
