@@ -54,8 +54,12 @@ RUN npm ci
 COPY agents/common/src/ /app/agents/common/src/
 COPY agents/valkey-glide-review/tsconfig.json ./
 COPY agents/valkey-glide-review/src/ ./src/
+# Dev dependencies are dropped by a production npm ci, not npm prune:
+# prune resolves the tree again and stops on ERESOLVE, because
+# @strands-agents/sdk declares an optional peer of openai 6 and the agent
+# uses openai 7. npm ci installs the lockfile as it is.
 RUN npx tsc -p tsconfig.json \
- && npm prune --omit=dev
+ && npm ci --omit=dev
 
 FROM base AS runtime
 

@@ -27,7 +27,11 @@ COPY agents/curator/tsconfig.json /app/agents/curator/
 COPY agents/curator/src/ /app/agents/curator/src/
 RUN npx tsc --noEmit && npx tsc -p tsconfig.json
 
-RUN npm prune --omit=dev
+# Dev dependencies are dropped by a production npm ci, not npm prune:
+# prune resolves the tree again and stops on ERESOLVE, because
+# @strands-agents/sdk declares an optional peer of openai 6 and the curator
+# uses openai 7. npm ci installs the lockfile as it is.
+RUN npm ci --omit=dev --no-audit --no-fund
 
 FROM public.ecr.aws/docker/library/node:26-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS runtime
 
