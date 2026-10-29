@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import './support/ts-resolve.mjs';
 
-const { createAppSecretSource, createInstallationTokens, fetchReviewComment, githubApi, parseAppSecret, RECEIVER_TOKEN_PERMISSIONS } = await import('../src/github.ts');
+const { createAppSecretSource, createInstallationTokens, fetchReviewComment, githubApi, githubGraphql, parseAppSecret, RECEIVER_TOKEN_PERMISSIONS } = await import('../src/github.ts');
 
 test('parseAppSecret reads the three fields', () => {
   assert.deepEqual(parseAppSecret(JSON.stringify({ webhook_secret: 'w', private_key: 'k', app_id: 123456 })), {
@@ -67,6 +67,34 @@ test('githubApi sends an authenticated JSON request with a timeout', async () =>
 test('githubApi tolerates an empty body', async () => {
   const api = githubApi('tok', async () => new Response(null, { status: 204 }));
   assert.deepEqual(await api('GET', 'x'), { status: 204, json: {} });
+});
+
+test('githubApi can DELETE', async () => {
+  const requests = [];
+  const api = githubApi('tok', async (url, init) => {
+    requests.push({ url, init });
+    return new Response(null, { status: 204 });
+  });
+  assert.deepEqual(await api('DELETE', 'repos/o/r/issues/1/labels/ready-for-human-review'), { status: 204, json: {} });
+  assert.equal(requests[0].init.method, 'DELETE');
+  assert.equal(requests[0].init.body, undefined);
+});
+
+test('githubGraphql posts the query and returns data', async () => {
+  const requests = [];
+  const fakeFetch = async (url, init) => {
+    requests.push({ url, init });
+    return new Response(JSON.stringify({ data: { ok: true } }), { status: 200 });
+  };
+  assert.deepEqual(await githubGraphql('tok', 'query { viewer { login } }', { n: 1 }, fakeFetch), { ok: true });
+  assert.equal(requests[0].url, 'https://api.github.com/graphql');
+  assert.equal(requests[0].init.method, 'POST');
+  assert.deepEqual(JSON.parse(requests[0].init.body), { query: 'query { viewer { login } }', variables: { n: 1 } });
+});
+
+test('githubGraphql reports GraphQL errors without returning partial data', async () => {
+  const fakeFetch = async () => new Response(JSON.stringify({ errors: [{ message: 'rate limited' }] }), { status: 200 });
+  await assert.rejects(githubGraphql('tok', 'query { x }', {}, fakeFetch), /rate limited/);
 });
 
 test('fetchReviewComment returns the comment author, anchor and body', async () => {

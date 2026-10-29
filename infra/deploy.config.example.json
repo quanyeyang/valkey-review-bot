@@ -18,13 +18,15 @@
       "id": "valkey-review",
       "reviewer": "valkey-review",
       "repo": "your-org/valkey",
-      "threadReplyReview": true
+      "threadReplyReview": true,
+      "readyLabel": "ready-for-human-review"
     },
     {
       "id": "valkey-glide-review",
       "reviewer": "valkey-glide-review",
       "repo": "your-org/valkey-glide",
-      "threadReplyReview": true
+      "threadReplyReview": true,
+      "readyLabel": "ready-for-human-review"
     }
   ],
   "curatorOnlyRoutes": [],

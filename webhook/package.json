@@ -4,7 +4,7 @@
   "private": true,
   "license": "BSD-3-Clause",
   "type": "module",
-  "description": "GitHub App webhook Lambdas for valkey-reviewer: receiver, SQS invoker, and token broker.",
+  "description": "GitHub App webhook Lambdas for valkey-reviewer: receiver, SQS invoker, token broker, and ready-label reconciler.",
   "engines": {
     "node": ">=24"
   },
@@ -16,6 +16,7 @@
     "@aws-sdk/client-bedrock-agentcore": "^3.1149.0",
     "@aws-sdk/client-bedrock-runtime": "^3.1149.0",
     "@aws-sdk/client-dynamodb": "^3.1149.0",
+    "@aws-sdk/client-lambda": "^3.1159.0",
     "@aws-sdk/client-secrets-manager": "^3.1149.0",
     "@aws-sdk/client-sqs": "^3.1149.0",
     "@aws-sdk/lib-dynamodb": "^3.1149.0",

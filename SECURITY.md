@@ -12,7 +12,8 @@ review runtime is treated as running untrusted code. The design keeps credential
 away from it:
 
 - The GitHub App private key and webhook secret are stored in AWS Secrets
-  Manager. Only the webhook receiver and the token brokers can read them. The
+  Manager. Only the webhook receiver, the token brokers and the ready-label
+  Lambda (when a route sets `readyLabel`) can read them. The
   receiver verifies deliveries and acts as the App for permission checks,
   acknowledgement comments and reading pull requests. Its installation tokens
   ask for `pull_requests: write`, `issues: read` and `metadata: read` only, so
@@ -25,6 +26,15 @@ away from it:
   repository's owner. The runtime cannot read the App key, and cannot get tokens
   for repositories that are not routed to that reviewer. No reviewer token
   carries `contents` permission, and the reviewer App needs none.
+- When a route sets `readyLabel`, a separate ready-label Lambda mints its own
+  short-lived token with `issues: write`, `pull_requests: read` and
+  `metadata: read`, reconciles one configured label on that pull request, and
+  never returns a token. Reviewer runtimes and the receiver invoke it with
+  `{ installation_id, repo, pr_number }` only. The label name and repository
+  allowlist come from the environment. The reviewer role still has no
+  `issues: write`: pull request code that steals the run's token cannot label
+  arbitrary issues. It can invoke the ready-label function, which only adds or
+  removes that one label after reading GitHub.
 - When the deployment proposes edits to the reviewers' built-in skill files,
   a separate skills-repo token broker gives the curator, and only the curator,
   a short-lived token for the bot's own repository, with `contents: write`,
@@ -71,7 +81,8 @@ away from it:
     budget is used up, after which the review runs anyway; under a review's
     own run key, it keeps that review from starting, and the review can end
     without running, in the dead-letter queue or as `[abandoned]`;
-  - invoke on its own token broker;
+  - invoke on its own token broker, and on the ready-label Lambda when a
+    route sets `readyLabel`;
   - log writes to its own runtime log groups
     (`/aws/bedrock-agentcore/runtimes/<runtime name>-*`);
   - image pulls from the CDK bootstrap container-assets repository. ECR cannot

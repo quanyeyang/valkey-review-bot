@@ -21,10 +21,11 @@ const state = (overrides = {}) => ({
   ...overrides,
 });
 
-function harness({ createReview, stateWrite, statusComment } = {}) {
+function harness({ createReview, stateWrite, statusComment, syncReadyLabel } = {}) {
   const reviews = [];
   const stateBodies = [];
   const terminal = [];
+  const readyLabel = [];
   const deps = {
     ctx,
     tokens: { get: async () => 'token' },
@@ -44,8 +45,9 @@ function harness({ createReview, stateWrite, statusComment } = {}) {
     },
     statusComment,
     terminalGate: createTerminalGate((tool, result) => terminal.push({ tool, result })),
+    syncReadyLabel: syncReadyLabel ?? (async () => { readyLabel.push(true); }),
   };
-  return { post: buildPostReviewTool(deps), skip: buildSkipTool(deps), reviews, stateBodies, terminal };
+  return { post: buildPostReviewTool(deps), skip: buildSkipTool(deps), reviews, stateBodies, terminal, readyLabel };
 }
 
 const comment = { path: 'src/server.c', line: 10, body: 'This leaks `buf` when `read` fails.' };
@@ -229,6 +231,35 @@ test('the run loop can tell whether its terminal callback reached the tools', as
   const dropped = () => {};
   await assembleCommonTools(opts);
   assert.equal(isTerminalCallbackWired(dropped), false);
+});
+
+test('a successful state write invokes the ready-label Lambda', async () => {
+  const skip = harness();
+  await skip.skip.invoke({ reason: 'Nothing new.', state: state() });
+  assert.deepEqual(skip.readyLabel, [true]);
+
+  const post = harness();
+  await post.post.invoke({ body: '', comments: [comment], state: state() });
+  assert.deepEqual(post.readyLabel, [true]);
+});
+
+test('a failed state write does not invoke the ready-label Lambda', async () => {
+  const skip = harness({ stateWrite: failingStateWrite });
+  await skip.skip.invoke({ reason: 'Nothing new.', state: state() });
+  assert.deepEqual(skip.readyLabel, []);
+
+  const post = harness({ stateWrite: failingStateWrite });
+  await post.post.invoke({ body: '', comments: [comment], state: state() });
+  assert.deepEqual(post.readyLabel, []);
+});
+
+test('a failed ready-label invoke does not fail the review', async () => {
+  const h = harness({
+    syncReadyLabel: async () => { throw new Error('lambda down'); },
+  });
+  const raw = await h.skip.invoke({ reason: 'Nothing new.', state: state() });
+  assert.equal(JSON.parse(raw).ok, true);
+  assert.equal(h.terminal.length, 1);
 });
 
 test('gh_api_read paths must name an allowed repository and endpoint', () => {

@@ -6,6 +6,7 @@ import {
   type DeploymentConfig,
   loadDeploymentConfig,
   parseDeploymentConfig,
+  readyLabelsByRepo,
   resolveConfigPath,
   tokenBrokerRepos,
 } from '../lib/deployment-config';
@@ -69,6 +70,8 @@ describe('defaults', () => {
       id: 'valkey-review', reviewer: 'valkey-review', repo: 'example-org/valkey',
       threadReplyReview: false, skipDrafts: false, mentionOnly: false, authorAllowlist: [],
     });
+    expect(config.routes[0]).not.toHaveProperty('readyLabel');
+    expect(readyLabelsByRepo(config)).toEqual({});
   });
 
   test('the committed example parses and holds placeholders only', () => {
@@ -239,6 +242,17 @@ describe('routes', () => {
     }));
     expect(message).toContain('routes[0].skipDrafts must be true or false');
     expect(message).toContain('routes[0].authorAllowlist[0]');
+  });
+
+  test('readyLabel is optional, 1 to 50 characters, and not whitespace-only or CR/LF', () => {
+    expect(parseDeploymentConfig(withChange((raw) => { raw.routes[0].readyLabel = ''; })).routes[0])
+      .not.toHaveProperty('readyLabel');
+    const labeled = parseDeploymentConfig(withChange((raw) => { raw.routes[0].readyLabel = 'ready-for-human-review'; }));
+    expect(labeled.routes[0].readyLabel).toBe('ready-for-human-review');
+    expect(readyLabelsByRepo(labeled)).toEqual({ 'example-org/valkey': 'ready-for-human-review' });
+    expect(problems(withChange((raw) => { raw.routes[0].readyLabel = '   '; }))).toContain('routes[0].readyLabel');
+    expect(problems(withChange((raw) => { raw.routes[0].readyLabel = 'ready\nfor-review'; }))).toContain('routes[0].readyLabel');
+    expect(problems(withChange((raw) => { raw.routes[0].readyLabel = 'x'.repeat(51); }))).toContain('routes[0].readyLabel');
   });
 });
 

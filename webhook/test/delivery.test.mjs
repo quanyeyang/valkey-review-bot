@@ -31,10 +31,11 @@ const ENV = {
   HAIKU_MODEL_ID: 'safety-model',
 };
 
-function setup({ env = {}, github = {}, store = fakeStore(), secrets = [SECRET], sendMessage, approve } = {}) {
+function setup({ env = {}, github = {}, store = fakeStore(), secrets = [SECRET], sendMessage, approve, syncReadyLabel } = {}) {
   const sent = [];
   const logs = [];
   const secretCalls = [];
+  const readyLabel = [];
   const api = fakeGitHub(github);
   const handler = createDeliveryHandler(loadReceiverConfig({ ...ENV, ...env }), {
     webhookSecret: async (refresh) => {
@@ -48,8 +49,11 @@ function setup({ env = {}, github = {}, store = fakeStore(), secrets = [SECRET],
     github: async () => api,
     approveInstruction: approve ?? (async () => ({ allow: true, reason: '' })),
     log: (line) => logs.push(line),
+    ...(syncReadyLabel !== undefined ? { syncReadyLabel } : {
+      syncReadyLabel: async (args) => { readyLabel.push(args); },
+    }),
   });
-  return { handler, sent, logs, secretCalls, store, api };
+  return { handler, sent, logs, secretCalls, store, api, readyLabel };
 }
 
 function delivery(eventType, payload, { secret = SECRET, base64 = false } = {}) {
@@ -921,6 +925,85 @@ test('an acknowledgement to the bot is not a summons', async () => {
   assert.equal(body(resp).skipped, 'noise:mention-short', 'it goes to the feedback path, which drops it');
   assert.equal(sent.length, 0);
   assert.equal(api.calls.length, 0);
+});
+
+const READY_ENV = {
+  REVIEW_ROUTE_MAP_JSON: JSON.stringify({
+    ...JSON.parse(ENV.REVIEW_ROUTE_MAP_JSON),
+    [REPO]: { ...JSON.parse(ENV.REVIEW_ROUTE_MAP_JSON)[REPO], readyLabel: 'ready-for-human-review' },
+    [GLIDE]: { ...JSON.parse(ENV.REVIEW_ROUTE_MAP_JSON)[GLIDE], readyLabel: 'ready-for-human-review' },
+  }),
+};
+
+test('synchronize still queues the review and reconciles the ready label', async () => {
+  const { handler, sent, readyLabel } = setup({ env: READY_ENV });
+  const resp = await handler(delivery('pull_request', push('bbb')));
+  assert.equal(body(resp).enqueued, `${REPO}#7#bbb#push`);
+  assert.equal(sent[0].queueUrl, 'q-valkey');
+  assert.deepEqual(readyLabel, [{ installationId: 42, repo: REPO, prNumber: 7 }]);
+});
+
+test('opened does not reconcile the ready label; closed, draft and ready_for_review do', async () => {
+  const { handler, readyLabel } = setup({ env: READY_ENV });
+  await handler(delivery('pull_request', prEvent('opened')));
+  assert.deepEqual(readyLabel, []);
+  await handler(delivery('pull_request', prEvent('closed')));
+  await handler(delivery('pull_request', prEvent('converted_to_draft')));
+  await handler(delivery('pull_request', prEvent('ready_for_review')));
+  assert.deepEqual(readyLabel, [
+    { installationId: 42, repo: REPO, prNumber: 7 },
+    { installationId: 42, repo: REPO, prNumber: 7 },
+    { installationId: 42, repo: REPO, prNumber: 7 },
+  ]);
+});
+
+test('a review thread event reconciles the label and is not curator feedback', async () => {
+  const { handler, sent, readyLabel } = setup({ env: READY_ENV });
+  const payload = {
+    action: 'resolved',
+    installation: { id: 42 },
+    repository: { full_name: REPO },
+    sender: { login: 'maintainer' },
+    pull_request: { number: 7, user: { login: 'author' }, head: { sha: 'abc123' } },
+  };
+  const resp = await handler(delivery('pull_request_review_thread', payload));
+  assert.equal(resp.statusCode, 200);
+  assert.equal(body(resp).skipped, 'action=resolved');
+  assert.equal(sent.length, 0);
+  assert.deepEqual(readyLabel, [{ installationId: 42, repo: REPO, prNumber: 7 }]);
+});
+
+test('a failed ready-label invoke does not 500 the webhook', async () => {
+  const { handler, sent } = setup({
+    env: READY_ENV,
+    syncReadyLabel: async () => { throw new Error('lambda down'); },
+  });
+  const errors = [];
+  const original = console.error;
+  console.error = (...args) => { errors.push(String(args[0])); };
+  try {
+    const thread = await handler(delivery('pull_request_review_thread', {
+      action: 'unresolved',
+      installation: { id: 42 },
+      repository: { full_name: REPO },
+      sender: { login: 'maintainer' },
+      pull_request: { number: 7 },
+    }));
+    assert.equal(thread.statusCode, 200);
+    const pushed = await handler(delivery('pull_request', push('bbb')));
+    assert.equal(pushed.statusCode, 200);
+    assert.equal(body(pushed).enqueued, `${REPO}#7#bbb#push`);
+    assert.equal(sent.length, 1);
+    assert.match(errors.join('\n'), /ready-label/);
+  } finally {
+    console.error = original;
+  }
+});
+
+test('a human review-comment reply reconciles the ready label', async () => {
+  const { handler, readyLabel } = setup({ env: READY_ENV, github: parentBy(BOT) });
+  await handler(delivery('pull_request_review_comment', reviewReply()));
+  assert.deepEqual(readyLabel, [{ installationId: 42, repo: REPO, prNumber: 7 }]);
 });
 
 test('a summons on an unrouted repository is skipped', async () => {

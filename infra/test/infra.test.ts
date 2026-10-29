@@ -111,6 +111,7 @@ describe('reviewer role', () => {
     const invoke = valkey.filter((st) => actionsOf(st).includes('lambda:InvokeFunction'));
     expect(JSON.stringify(invoke)).toContain('TokenBrokerValkeyReviewFn');
     expect(JSON.stringify(invoke)).not.toContain('TokenBrokerValkeyGlideReviewFn');
+    expect(JSON.stringify(invoke)).not.toContain('ReadyLabelFn');
   });
 
   test('the curator writes only its own runtime log groups', () => {
@@ -401,6 +402,55 @@ describe('token broker', () => {
       expect(broker.flatMap(actionsOf)).toContain('secretsmanager:GetSecretValue');
       expect(JSON.stringify(broker)).toContain(':secret:example/github-app-??????');
     }
+  });
+});
+
+describe('ready label', () => {
+  const labeledFixture = () => {
+    const raw = fixture();
+    raw.routes[0].readyLabel = 'ready-for-human-review';
+    return raw;
+  };
+
+  test('the function is absent when every readyLabel is empty', () => {
+    expect(functionIds(s.template(s.stacks.substrate), 'ReadyLabelFn')).toEqual([]);
+    expect(s.stacks.substrate.readyLabelFn).toBeUndefined();
+    expect(functionEnv(s.template(s.stacks.webhook), 'ReceiverFn')).not.toHaveProperty('READY_LABEL_FUNCTION');
+    expect(runtimeEnv(reviewerTemplate('valkey-review'))).not.toHaveProperty('READY_LABEL_FUNCTION');
+  });
+
+  test('reviewer still has no secretsmanager; may invoke token broker and ReadyLabelFn; cannot invoke the other reviewer\'s broker', () => {
+    const labeled = synth(labeledFixture());
+    const t = labeled.template(labeled.stacks.reviewers.get('valkey-review')!);
+    const statements = statementsForRole(t, runtimeRoleId(t));
+    expect(statements.flatMap(actionsOf).filter((a) => a.startsWith('secretsmanager:'))).toEqual([]);
+    const invoke = statements.filter((st) => actionsOf(st).includes('lambda:InvokeFunction'));
+    expect(JSON.stringify(invoke)).toContain('TokenBrokerValkeyReviewFn');
+    expect(JSON.stringify(invoke)).toContain('ReadyLabelFn');
+    expect(JSON.stringify(invoke)).not.toContain('TokenBrokerValkeyGlideReviewFn');
+    expect(runtimeEnv(t)).toHaveProperty('READY_LABEL_FUNCTION');
+  });
+
+  test('the function reads the App secret, and only reviewers and the receiver may invoke it', () => {
+    const labeled = synth(labeledFixture());
+    const substrate = labeled.template(labeled.stacks.substrate);
+    const fnEnv = functionEnv(substrate, 'ReadyLabelFn');
+    expect(fnEnv).toMatchObject({
+      GITHUB_APP_ID: '123456',
+      BOT_LOGIN: 'example-reviewer[bot]',
+      ALLOWED_REPOS_JSON: JSON.stringify(['example-org/valkey']),
+      READY_LABEL_BY_REPO_JSON: JSON.stringify({ 'example-org/valkey': 'ready-for-human-review' }),
+    });
+    expect(statementsForRole(substrate, functionRoleId(substrate, 'ReadyLabelFn')).flatMap(actionsOf))
+      .toContain('secretsmanager:GetSecretValue');
+
+    const holders = allStatements(labeled).filter(({ statement }) => JSON.stringify(statement.Resource).includes('ReadyLabelFn'));
+    const roles = new Set(holders.flatMap(({ roles }) => roles));
+    expect(roles.has(runtimeRoleId(labeled.template(labeled.stacks.reviewers.get('valkey-review')!)))).toBe(true);
+    expect(roles.has(runtimeRoleId(labeled.template(labeled.stacks.reviewers.get('valkey-glide-review')!)))).toBe(true);
+    expect(roles.has(functionRoleId(labeled.template(labeled.stacks.webhook), 'ReceiverFn'))).toBe(true);
+    expect(roles.has(runtimeRoleId(labeled.template(labeled.stacks.curator)))).toBe(false);
+    expect(functionEnv(labeled.template(labeled.stacks.webhook), 'ReceiverFn')).toHaveProperty('READY_LABEL_FUNCTION');
   });
 });
 

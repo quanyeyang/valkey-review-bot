@@ -9,7 +9,7 @@ secret names.
 
 | Stack | Contents |
 | --- | --- |
-| `ValkeyReviewerSubstrate` | KMS key, prompt and skill bucket, reference to the GitHub App secret, one token broker Lambda per reviewer, the skills-repo token broker Lambda when `skillsRepo` is set, run heartbeat table |
+| `ValkeyReviewerSubstrate` | KMS key, prompt and skill bucket, reference to the GitHub App secret, one token broker Lambda per reviewer, the skills-repo token broker Lambda when `skillsRepo` is set, the ready-label Lambda when a route sets `readyLabel`, run heartbeat table |
 | `ValkeyReviewAgent`, `ValkeyGlideReviewAgent` | One reviewer each: AgentCore runtime, its execution role, its concerns table, prompt and skill upload |
 | `ValkeyReviewerCurator` | Curator runtime and its execution role, and the upload of `prompt.md`, `skill.md` and `skill-check.md` under `curator/` |
 | `ValkeyReviewWebhook` | HTTP API, receiver Lambda, idempotency table, one queue and worker per route, the curator queue and worker, dead-letter queues |
@@ -25,7 +25,8 @@ Each runtime has its own role:
     concerns tables, but the role has no DynamoDB access to them;
   - read its own skills registry;
   - get, put and update any item in the shared heartbeat table;
-  - invoke its own token broker;
+  - invoke its own token broker, and the ready-label Lambda when a route
+    sets `readyLabel`;
   - write its own runtime log groups
     (`/aws/bedrock-agentcore/runtimes/<runtime name>-*`, for example
     `valkey_review_runtime-*`);
@@ -94,6 +95,10 @@ permissions are granted only when an `openai.*` model is configured.
    edits to the reviewers' skill files need an App with Contents on the
    bot's repository: this App by default, or a dedicated one; see
    [The skills-repo App](#the-skills-repo-app).
+   If a route sets `readyLabel`, the App also needs Issues (write), and
+   you must subscribe it to `pull_request_review_thread`. Approve the new
+   permission on each existing installation after deploying. Create the
+   label in each repository yourself; the bot never creates it.
 4. Store the App credentials in Secrets Manager, in the target account and
    region, under the name you set in `github.appSecretName`. The secret is a
    JSON object:
@@ -226,6 +231,7 @@ reviewer. The token broker issues tokens only for these repositories.
 | `skipDrafts` | `false` | Draft pull requests are not reviewed when opened or pushed to; the review runs when the draft is marked ready. |
 | `mentionOnly` | `false` | No automatic reviews, on open, reopen or new commits. Reviews run only when a maintainer tags the bot. |
 | `authorAllowlist` | `[]` | When not empty, only pull requests by these logins get automatic reviews. |
+| `readyLabel` | empty | GitHub label this route projects readiness onto (1–50 characters, no CR/LF, not whitespace-only). Empty turns the feature off. The label is added only when the PR is open and not a draft, this App's state comment says **Ready for human review.** at the current head, and every review thread this App started is resolved or has a later human reply. Anything else removes that one label. The operator creates the label in the repository; a missing label is logged, not created. Requires Issues (write) on the App and a subscription to `pull_request_review_thread`. |
 
 ### `curatorOnlyRoutes`
 
@@ -653,7 +659,10 @@ Contents either way: the receiver for `pull_requests: write`,
 `issues: read` and `metadata: read` (`RECEIVER_TOKEN_PERMISSIONS` in
 `webhook/src/github.ts`), and the reviewer brokers for
 `pull_requests: write` and `metadata: read`. So their tokens, and the
-reviewer runtimes, never get Contents permission.
+reviewer runtimes, never get Contents permission. The ready-label Lambda,
+when a route sets `readyLabel`, asks for `issues: write`,
+`pull_requests: read` and `metadata: read` itself and never returns that
+token.
 
 The commits are made with the broker's token, so GitHub authors them as
 the App's bot user. Their `Signed-off-by` line is `skillsRepo.signOff`, or

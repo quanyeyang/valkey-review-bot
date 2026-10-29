@@ -69,6 +69,8 @@ export interface WebhookStackProps extends cdk.StackProps {
   readonly maxAutomaticReviewsPerPr: number;
   /** SQS delay of a review that new commits start. */
   readonly pushReviewDelaySeconds: number;
+  /** Projects readiness onto a PR label. Absent when no route sets readyLabel. */
+  readonly readyLabelFunction?: lambda.IFunction;
 }
 
 /** One entry of REVIEW_ROUTE_MAP_JSON, keyed by repository full name. */
@@ -80,6 +82,7 @@ export interface ReviewRouteEntry {
   readonly mentionOnly?: true;
   readonly skipDrafts?: true;
   readonly threadReplyReview?: true;
+  readonly readyLabel?: string;
 }
 
 /**
@@ -104,6 +107,7 @@ export function routeMaps(
       ...(route.mentionOnly ? { mentionOnly: true } : {}),
       ...(route.skipDrafts ? { skipDrafts: true } : {}),
       ...(route.threadReplyReview ? { threadReplyReview: true } : {}),
+      ...(route.readyLabel ? { readyLabel: route.readyLabel } : {}),
     };
     curator[route.repo] = { reviewerId: route.reviewer };
   }
@@ -272,6 +276,7 @@ export class WebhookStack extends cdk.Stack {
         // The receiver treats any set value as the whole list, so an empty
         // list must leave the variable unset to keep the built-in logins.
         ...(github.knownBotLogins?.length ? { KNOWN_BOT_LOGINS: github.knownBotLogins.join(',') } : {}),
+        ...(props.readyLabelFunction ? { READY_LABEL_FUNCTION: props.readyLabelFunction.functionName } : {}),
       },
       projectRoot: webhookRoot,
       depsLockFilePath: depsLock,
@@ -282,6 +287,7 @@ export class WebhookStack extends cdk.Stack {
     // counters, the per-pull-request round counters and pending markers.
     idempotency.grantReadWriteData(receiver);
     props.githubAppSecret.grantRead(receiver);
+    props.readyLabelFunction?.grantInvoke(receiver);
     // Safety gate on maintainer instructions in @mentions (Converse API).
     receiver.addToRolePolicy(new iam.PolicyStatement({
       sid: 'InvokeSafetyModel',

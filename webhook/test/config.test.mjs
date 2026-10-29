@@ -44,6 +44,15 @@ test('routes are keyed by lowercased repository and carry their route id', () =>
   assert.deepEqual(glide.authorAllowlist, ['some-maintainer']);
   assert.equal(glide.skipDrafts, true);
   assert.equal(glide.threadReplyReview, true);
+  assert.equal(glide.readyLabel, undefined);
+});
+
+test('readyLabel is optional and must be a non-empty string when set', () => {
+  const withRoute = (entry) => ({ ...base, REVIEW_ROUTE_MAP_JSON: JSON.stringify({ 'o/r': entry }) });
+  const good = { routeId: 'r', queueUrl: 'q', reviewerId: 'v', readyLabel: 'ready-for-human-review' };
+  assert.equal(loadReceiverConfig(withRoute(good)).reviewRoutes.get('o/r').readyLabel, 'ready-for-human-review');
+  assert.equal(loadReceiverConfig(withRoute({ ...good, readyLabel: undefined })).reviewRoutes.get('o/r').readyLabel, undefined);
+  assert.throws(() => loadReceiverConfig(withRoute({ ...good, readyLabel: 1 })), /readyLabel must be a non-empty string/);
 });
 
 test('required settings have no defaults', () => {

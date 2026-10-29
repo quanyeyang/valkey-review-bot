@@ -33,6 +33,11 @@ export interface AgentEnv {
   /** Lambda that issues repo-scoped GitHub tokens (see github-auth.ts). */
   readonly tokenBrokerFunction: string;
   /**
+   * Lambda that projects readiness onto a PR label. Empty when the
+   * deployment has no readyLabel on any route.
+   */
+  readonly readyLabelFunction: string;
+  /**
    * Id (or ARN) of the AWS Agent Registry registry holding this reviewer's
    * graduated skills. Empty means none; the system prompt then has no
    * graduated-skills section.
@@ -129,6 +134,7 @@ export function loadEnv(env: EnvSource = process.env): AgentEnv {
     skillKey: required(env, 'SKILL_S3_KEY'),
     githubAppId,
     tokenBrokerFunction: required(env, 'TOKEN_BROKER_FUNCTION'),
+    readyLabelFunction: optional(env, 'READY_LABEL_FUNCTION'),
     skillsRegistryId: optional(env, 'SKILLS_REGISTRY_ID'),
     heartbeatTable: optional(env, 'HEARTBEAT_TABLE'),
     maxIterations: positiveInt(env, 'MAX_ITERATIONS', DEFAULT_MAX_ITERATIONS),

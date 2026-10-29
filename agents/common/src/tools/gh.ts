@@ -128,6 +128,11 @@ export interface GhToolsDeps {
    * run. When absent, each tool gets a gate of its own.
    */
   readonly terminalGate?: TerminalGate;
+  /**
+   * After a successful state write, invoke the ready-label Lambda.
+   * Failures are logged here and never fail the terminal call.
+   */
+  readonly syncReadyLabel?: () => Promise<void>;
 }
 
 /** Repositories gh_api_read may read: the PR's and the upstream the release branches come from. */
@@ -150,6 +155,14 @@ function checkState(deps: GhToolsDeps, state: ReviewState): string | null {
 async function writeState(deps: GhToolsDeps, state: ReviewState): Promise<{ url: string | null; error: string | null }> {
   try {
     const { url } = await deps.stateWriter.write(renderReviewState(state, deps.ctx.headSha));
+    if (deps.syncReadyLabel) {
+      try {
+        await deps.syncReadyLabel();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[ready-label] invoke failed: ${msg}`);
+      }
+    }
     return { url, error: null };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

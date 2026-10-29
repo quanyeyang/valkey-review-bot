@@ -38,6 +38,8 @@ export interface AgentStackProps extends cdk.StackProps {
   readonly substrateKey: kms.IKey;
   readonly heartbeatTable: dynamodb.ITable;
   readonly tokenBroker: lambda.IFunction;
+  /** Projects readiness onto a PR label. Absent when no route sets readyLabel. */
+  readonly readyLabelFunction?: lambda.IFunction;
   readonly githubAppId: string;
   /** The reviewer's agent-skills registry (ID or ARN). */
   readonly skillsRegistry: string;
@@ -101,7 +103,9 @@ export class ValkeyReviewAgentStack extends cdk.Stack {
     // The reviewer runs code from the pull request, so its role holds no
     // secrets and has no Secrets Manager, concerns-table or registry-write
     // access. Its only writes are its own logs, the heartbeat table and,
-    // through the token broker, the pull request.
+    // through the token broker, the pull request. The ready-label Lambda,
+    // when granted, mints issues:write itself; this role never holds that
+    // permission.
     const runtimeName = props.agentId.replace(/-/g, '_') + '_runtime';
     this.role = createRuntimeRole(this, 'RuntimeRole', {
       description: `Execution role for the ${props.agentId} runtime.`,
@@ -118,6 +122,7 @@ export class ValkeyReviewAgentStack extends cdk.Stack {
     props.substrateKey.grantDecrypt(this.role);
     props.heartbeatTable.grant(this.role, 'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem');
     props.tokenBroker.grantInvoke(this.role);
+    props.readyLabelFunction?.grantInvoke(this.role);
     const m = props.models;
     for (const statement of modelAccessStatements(this, [
       m.reviewer.primary, m.reviewer.fallback, m.summarizer.primary, m.summarizer.fallback, ...m.extraGrants,
@@ -161,6 +166,7 @@ export class ValkeyReviewAgentStack extends cdk.Stack {
         SKILL_S3_KEY: skillKey,
         GITHUB_APP_ID: props.githubAppId,
         TOKEN_BROKER_FUNCTION: props.tokenBroker.functionName,
+        ...(props.readyLabelFunction ? { READY_LABEL_FUNCTION: props.readyLabelFunction.functionName } : {}),
         SKILLS_REGISTRY_ID: props.skillsRegistry,
         HEARTBEAT_TABLE: props.heartbeatTable.tableName,
         MAX_ITERATIONS: String(props.agent.maxIterations),

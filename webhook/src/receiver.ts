@@ -1,5 +1,6 @@
 import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
@@ -20,6 +21,8 @@ const config = loadReceiverConfig(process.env);
 
 const sm = new SecretsManagerClient({});
 const sqs = new SQSClient({});
+const readyLabelFunction = process.env.READY_LABEL_FUNCTION?.trim() ?? '';
+const lambda = readyLabelFunction ? new LambdaClient({}) : undefined;
 const secrets = createAppSecretSource(async () =>
   (await sm.send(new GetSecretValueCommand({ SecretId: config.githubSecretArn }))).SecretString);
 const installationToken = createInstallationTokens(secrets);
@@ -36,4 +39,17 @@ export const handler = createDeliveryHandler(config, {
   },
   github: async (installationId) => githubApi(await installationToken(installationId)),
   approveInstruction: createSafetyGate({ client: new BedrockRuntimeClient({}), modelId: config.safetyModelId }),
+  ...(lambda && readyLabelFunction ? {
+    syncReadyLabel: async ({ installationId, repo, prNumber }) => {
+      await lambda.send(new InvokeCommand({
+        FunctionName: readyLabelFunction,
+        InvocationType: 'Event',
+        Payload: Buffer.from(JSON.stringify({
+          installation_id: installationId,
+          repo,
+          pr_number: prNumber,
+        })),
+      }));
+    },
+  } : {}),
 });

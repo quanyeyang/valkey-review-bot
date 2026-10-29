@@ -19,6 +19,8 @@ export interface CommonToolsOpts {
    * `onTerminal` from AssembleBaseOpts.
    */
   readonly onTerminal?: (tool: TerminalToolName, result: string) => void;
+  /** After a successful state write; pass through from AssembleBaseOpts. */
+  readonly syncReadyLabel?: () => Promise<void>;
 }
 
 /**
@@ -42,6 +44,7 @@ export async function assembleCommonTools(opts: CommonToolsOpts): Promise<readon
     statusComment: opts.statusComment,
     stateWriter: createStateCommentWriter(opts.octokit, opts.ctx),
     terminalGate: createTerminalGate(opts.onTerminal),
+    syncReadyLabel: opts.syncReadyLabel,
   };
 
   return [

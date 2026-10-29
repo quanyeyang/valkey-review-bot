@@ -59,3 +59,34 @@ export function createOctokit(tokens: TokenSource): Octokit {
   });
   return octokit;
 }
+
+/**
+ * Fire-and-forget invoke of the ready-label Lambda. Never throws: a
+ * failed invoke is logged and the review continues. The function mints
+ * its own issues:write token; this payload is only the PR identity.
+ */
+export function createReadyLabelInvoker(opts: {
+  functionName: string;
+  region: string;
+  installationId: number;
+  repo: string;
+  prNumber: number;
+}): () => Promise<void> {
+  const lambda = new LambdaClient({ region: opts.region });
+  return async () => {
+    try {
+      await lambda.send(new InvokeCommand({
+        FunctionName: opts.functionName,
+        InvocationType: 'Event',
+        Payload: Buffer.from(JSON.stringify({
+          installation_id: opts.installationId,
+          repo: opts.repo,
+          pr_number: opts.prNumber,
+        })),
+      }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[ready-label] invoke failed: ${msg}`);
+    }
+  };
+}

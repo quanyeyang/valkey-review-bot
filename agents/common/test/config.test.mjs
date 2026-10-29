@@ -32,6 +32,7 @@ test('a minimal environment gets the documented defaults', () => {
   assert.equal(env.heartbeatTable, '');
   assert.equal(env.upstreamRepo, '');
   assert.equal(env.workspaceRoot, '/workspace/valkey');
+  assert.equal(env.readyLabelFunction, '');
 });
 
 test('model ids, regions and the workspace root are required', () => {

@@ -44,6 +44,12 @@ export interface RouteConfig {
   readonly skipDrafts: boolean;
   readonly mentionOnly: boolean;
   readonly authorAllowlist: readonly string[];
+  /**
+   * GitHub label this route projects readiness onto. Absent or empty
+   * turns the feature off for the route. The operator creates the label
+   * in the repository; the bot never does.
+   */
+  readonly readyLabel?: string;
 }
 
 export interface CuratorOnlyRouteConfig {
@@ -373,7 +379,8 @@ export function parseDeploymentConfig(raw: unknown, env: { readonly CDK_DEFAULT_
 
   const routes: RouteConfig[] = r.array(top.routes, 'routes', undefined).map((value, i) => {
     const at = `routes[${i}]`;
-    const o = r.object(value, at, ['id', 'reviewer', 'repo', 'threadReplyReview', 'skipDrafts', 'mentionOnly', 'authorAllowlist']);
+    const o = r.object(value, at, ['id', 'reviewer', 'repo', 'threadReplyReview', 'skipDrafts', 'mentionOnly', 'authorAllowlist', 'readyLabel']);
+    const readyLabel = readyLabelOf(r, o.readyLabel, `${at}.readyLabel`);
     return {
       id: r.string(o.id, `${at}.id`, { pattern: ROUTE_ID, hint: 'letters, digits and hyphens' }),
       reviewer: r.oneOf(o.reviewer, `${at}.reviewer`, REVIEWER_IDS),
@@ -382,6 +389,7 @@ export function parseDeploymentConfig(raw: unknown, env: { readonly CDK_DEFAULT_
       skipDrafts: r.boolean(o.skipDrafts, `${at}.skipDrafts`, false),
       mentionOnly: r.boolean(o.mentionOnly, `${at}.mentionOnly`, false),
       authorAllowlist: r.strings(o.authorAllowlist, `${at}.authorAllowlist`, { pattern: LOGIN, hint: 'a GitHub login', fallback: [] }),
+      ...(readyLabel ? { readyLabel } : {}),
     };
   });
   if (Array.isArray(top.routes) && routes.length === 0) r.fail('routes', 'must list at least one route');
@@ -670,9 +678,32 @@ export function loadDeploymentConfig(contextValue: unknown, env: NodeJS.ProcessE
   }
 }
 
+/** Empty string or unset: the route does not project a ready-for-human-review label. */
+function readyLabelOf(r: Reader, value: unknown, at: string): string | undefined {
+  if (value === undefined || value === '') return undefined;
+  if (typeof value !== 'string') {
+    r.fail(at, 'must be a string');
+    return undefined;
+  }
+  if (/[\r\n]/.test(value) || value.trim() === '' || value.length > 50) {
+    r.fail(at, 'must be 1 to 50 characters with no CR/LF and not whitespace-only');
+    return undefined;
+  }
+  return value;
+}
+
 /** Repositories one reviewer's token broker may issue tokens for: that reviewer's review routes. */
 export function tokenBrokerRepos(config: DeploymentConfig, reviewerId: ReviewerId): string[] {
   return [...new Set(config.routes.filter((route) => route.reviewer === reviewerId).map((route) => route.repo))];
+}
+
+/** Repositories that project readiness onto a GitHub label, mapped to that label. */
+export function readyLabelsByRepo(config: DeploymentConfig): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const route of config.routes) {
+    if (route.readyLabel) out[route.repo] = route.readyLabel;
+  }
+  return out;
 }
 
 /**

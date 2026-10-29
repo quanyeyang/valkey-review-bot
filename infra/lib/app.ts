@@ -2,7 +2,7 @@ import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import { CuratorAgentStack } from './curator-agent-stack';
 import { DecayCronStack } from './decay-cron-stack';
-import { type DeploymentConfig, REVIEWER_IDS, type ReviewerId, tokenBrokerRepos } from './deployment-config';
+import { type DeploymentConfig, REVIEWER_IDS, type ReviewerId, readyLabelsByRepo, tokenBrokerRepos } from './deployment-config';
 import { SubstrateStack } from './substrate-stack';
 import { ValkeyReviewAgentStack } from './valkey-review-agent-stack';
 import { WebhookStack } from './webhook-stack';
@@ -40,12 +40,14 @@ export function addValkeyReviewerStacks(
     synthesizer: new cdk.DefaultStackSynthesizer({ qualifier: config.aws.bootstrapQualifier }),
   });
 
+  const readyLabels = readyLabelsByRepo(config);
   const substrate = new SubstrateStack(app, 'ValkeyReviewerSubstrate', {
     ...common(),
     description: 'valkey-reviewer shared resources: assets bucket, KMS key, GitHub token broker and run heartbeat table.',
     github: config.github,
     allowedRepos: Object.fromEntries(REVIEWER_IDS.map((r) => [r, tokenBrokerRepos(config, r)])) as Record<ReviewerId, string[]>,
     ...(config.skillsRepo ? { skillsRepo: config.skillsRepo } : {}),
+    ...(Object.keys(readyLabels).length > 0 ? { readyLabels } : {}),
   });
 
   const reviewers = new Map<ReviewerId, ValkeyReviewAgentStack>();
@@ -65,6 +67,7 @@ export function addValkeyReviewerStacks(
       substrateKey: substrate.key,
       heartbeatTable: substrate.heartbeatTable,
       tokenBroker: substrate.tokenBrokers.get(reviewerId)!,
+      ...(substrate.readyLabelFn ? { readyLabelFunction: substrate.readyLabelFn } : {}),
       githubAppId: config.github.appId,
       skillsRegistry: config.skillsRegistries[reviewerId],
       upstreamRepo: config.upstreamRepos[reviewerId],
@@ -109,6 +112,7 @@ export function addValkeyReviewerStacks(
     dailyReviewBudget: config.dailyReviewBudget,
     maxAutomaticReviewsPerPr: config.maxAutomaticReviewsPerPr,
     pushReviewDelaySeconds: config.pushReviewDelaySeconds,
+    ...(substrate.readyLabelFn ? { readyLabelFunction: substrate.readyLabelFn } : {}),
   });
 
   // Created after the webhook stack, whose curator queue it sends to.

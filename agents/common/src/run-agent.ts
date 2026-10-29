@@ -4,7 +4,7 @@ import { Agent, AfterToolCallEvent, BeforeModelCallEvent, type AgentStreamEvent,
 import type { Octokit } from '@octokit/rest';
 
 import { loadEnv, loadAssets, type AgentEnv } from './config.js';
-import { createOctokit, createTokenSource, type TokenSource } from './github-auth.js';
+import { createOctokit, createReadyLabelInvoker, createTokenSource, type TokenSource } from './github-auth.js';
 import { createHeartbeat } from './heartbeat.js';
 import { prepareWorkspace, renderPrOverview, type PrContext } from './workspace.js';
 import { labelSuppressedPieces, loadGraduatedSkills, renderGraduatedSkills } from './graduated-skills.js';
@@ -40,6 +40,8 @@ export interface AssembleBaseOpts {
    * when they succeed, and that is how the run knows the review is done.
    */
   readonly onTerminal?: (tool: TerminalToolName, result: string) => void;
+  /** After a successful state write; pass through to assembleCommonTools. */
+  readonly syncReadyLabel?: () => Promise<void>;
 }
 
 export type AssembleTools = (opts: AssembleBaseOpts) => Promise<readonly unknown[]>;
@@ -294,6 +296,15 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
       }
 
       yield { event: 'status', data: { phase: 'tools' } };
+      const syncReadyLabel = env.readyLabelFunction
+        ? createReadyLabelInvoker({
+            functionName: env.readyLabelFunction,
+            region: env.region,
+            installationId: payload.installation_id,
+            repo: payload.repo,
+            prNumber: payload.pr_number,
+          })
+        : undefined;
       const tools = await assembleTools({
         ctx,
         octokit,
@@ -302,6 +313,7 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
         env,
         statusComment,
         onTerminal,
+        syncReadyLabel,
       });
       if (!isTerminalCallbackWired(onTerminal)) {
         throw new Error('assembleTools did not pass onTerminal to assembleCommonTools, so the run could not tell when the review is done');

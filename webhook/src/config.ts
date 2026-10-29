@@ -51,6 +51,11 @@ export interface ReviewRoute {
    * question); in any other thread the reply is an ordinary summons.
    */
   readonly threadReplyReview: boolean;
+  /**
+   * GitHub label this route projects readiness onto. Absent when the
+   * route does not use a ready-for-human-review label.
+   */
+  readonly readyLabel?: string;
 }
 
 export interface CuratorRoute {
@@ -146,6 +151,13 @@ function routeFlag(entry: Record<string, unknown>, key: string, at: string): boo
   return value;
 }
 
+function routeOptionalString(entry: Record<string, unknown>, key: string, at: string): string | undefined {
+  const value = entry[key];
+  if (value === undefined || value === '') return undefined;
+  if (typeof value !== 'string') throw new Error(`${at}.${key} must be a non-empty string`);
+  return value;
+}
+
 function routeEntry(value: unknown, at: string): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(`${at} must be an object`);
   return value as Record<string, unknown>;
@@ -160,6 +172,7 @@ function parseReviewRoutes(raw: Record<string, unknown>): Map<string, ReviewRout
     if (!Array.isArray(allowlist) || !allowlist.every((a) => typeof a === 'string')) {
       throw new Error(`${at}.authorAllowlist must be an array of logins`);
     }
+    const readyLabel = routeOptionalString(entry, 'readyLabel', at);
     routes.set(repo.toLowerCase(), {
       routeId: routeString(entry, 'routeId', at),
       queueUrl: routeString(entry, 'queueUrl', at),
@@ -168,6 +181,7 @@ function parseReviewRoutes(raw: Record<string, unknown>): Map<string, ReviewRout
       mentionOnly: routeFlag(entry, 'mentionOnly', at),
       skipDrafts: routeFlag(entry, 'skipDrafts', at),
       threadReplyReview: routeFlag(entry, 'threadReplyReview', at),
+      ...(readyLabel ? { readyLabel } : {}),
     });
   }
   return routes;

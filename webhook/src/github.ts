@@ -141,7 +141,7 @@ export interface GitHubResponse {
 }
 
 /** A REST call against api.github.com, authenticated as one installation. */
-export type GitHubApi = (method: 'GET' | 'POST' | 'PATCH', path: string, body?: unknown) => Promise<GitHubResponse>;
+export type GitHubApi = (method: 'GET' | 'POST' | 'PATCH' | 'DELETE', path: string, body?: unknown) => Promise<GitHubResponse>;
 
 /** The receiver has 30 seconds per delivery; no single GitHub call may use most of it. */
 const GITHUB_TIMEOUT_MS = 8_000;
@@ -167,6 +167,42 @@ export function githubApi(token: string, fetchImpl: typeof fetch = fetch): GitHu
     }
     return { status: resp.status, json };
   };
+}
+
+/**
+ * A GraphQL call against api.github.com/graphql. Returns `data`, and
+ * throws when the HTTP status is not 200 or the body lists errors.
+ */
+export async function githubGraphql(
+  token: string,
+  query: string,
+  variables: Record<string, unknown>,
+  fetchImpl: typeof fetch = fetch,
+): Promise<unknown> {
+  const resp = await fetchImpl('https://api.github.com/graphql', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    body: JSON.stringify({ query, variables }),
+    signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
+  });
+  let json: unknown = {};
+  try {
+    json = await resp.json();
+  } catch {
+    // Empty or non-JSON body; reported from the status below.
+  }
+  if (resp.status !== 200) throw new Error(`POST graphql returned ${resp.status}`);
+  const body = json as { data?: unknown; errors?: readonly { message?: unknown }[] };
+  if (body.errors?.length) {
+    const message = body.errors.map((e) => (typeof e.message === 'string' ? e.message : 'error')).join('; ');
+    throw new Error(`graphql: ${message}`);
+  }
+  return body.data;
 }
 
 /**
