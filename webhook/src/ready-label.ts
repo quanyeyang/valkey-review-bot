@@ -7,16 +7,29 @@ import { fetchRepoInstallation, type GitHubApi } from './github.js';
  * and mutates GitHub. Callers send only `{ installation_id, repo, pr_number }`.
  * The label name comes from the environment, never from the event.
  *
- * The label is added only when the PR is open and not a draft, this App's
- * sticky state comment says ready at the current head, and every review
- * thread this App started is resolved or has a later human reply. Anything
- * else removes the label if it is present. The label is never created.
+ * The label is added when the PR is open and not a draft, this App has a
+ * completed review at the current head, every review thread this App
+ * started is resolved or has a later human reply, and any PR-wide
+ * concern (a finding with no location, or Direction) is ready or has a
+ * later human issue comment. The agent's verdict may still be
+ * needs_work: a human disagreement hands the PR to maintainers without
+ * waiting for the agent to withdraw. Missing, failed, or stale reviews
+ * never count. Anything else removes the label if it is present. The
+ * label is never created.
+ *
+ * Before a mutation the head is fetched again, and after one it is
+ * fetched again: an older invocation that raced a push cannot leave the
+ * label on the new head. Overlapping applies for the same PR on one
+ * isolate run one at a time.
  */
 
 /** Identical to agents/common/src/review-state.ts. Tests parse that renderer. */
 export const STATE_MARKER = '<!-- valkey-reviewer:state -->';
 
 export const LABEL_PERMISSIONS = { issues: 'write', pull_requests: 'read', metadata: 'read' } as const;
+
+/** Restarts when the head moves under a reconcile; then gives up without adding. */
+const MAX_RECONCILE_ATTEMPTS = 4;
 
 export interface LabelTokenRequest {
   readonly installationId: number;
@@ -90,7 +103,16 @@ const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $cu
 interface IssueComment {
   readonly body?: string | null;
   readonly user?: GitHubUser;
+  readonly created_at?: string;
+  readonly updated_at?: string;
   readonly performed_via_github_app?: { readonly id?: unknown } | null;
+}
+
+interface PullSnapshot {
+  readonly state: string;
+  readonly draft: boolean;
+  readonly headSha: string;
+  readonly labels: readonly string[];
 }
 
 /**
@@ -107,18 +129,65 @@ export function parseReadyState(body: string): ReadyState | undefined {
   return { ready, headPrefix: stamp[1]!.toLowerCase() };
 }
 
-/** True when the PR should carry the configured ready label. */
+/**
+ * True when the rendered state still has a PR-wide concern a human must
+ * answer: an open finding with no `path:line`, or a Direction section.
+ * Inline findings are the review threads. Matches renderReviewState.
+ */
+export function openPrWideConcerns(body: string): boolean {
+  if (!body.startsWith(STATE_MARKER)) return false;
+  if (/\*\*Direction\*\*/.test(body)) return true;
+  const heading = /\*\*Open findings(?::\*\* none\.| \((\d+)\)\*\*)/.exec(body);
+  if (!heading || heading[0].includes('none')) return false;
+  const rest = body.slice(body.indexOf(heading[0]) + heading[0].length);
+  const section = rest.split(/\n\*\*/)[0] ?? '';
+  for (const line of section.split('\n')) {
+    if (!line.startsWith('- ')) continue;
+    if (!/^- (?:\(minor\) )?`/.test(line)) return true;
+  }
+  return false;
+}
+
+/**
+ * A non-bot issue comment created after the state comment was last
+ * rewritten. Used for PR-wide findings, which have no review thread.
+ */
+export function humanAnsweredAfter(
+  comments: readonly IssueComment[],
+  stateComment: IssueComment,
+  isBot: (user: GitHubUser | undefined) => boolean,
+): boolean {
+  const after = stateComment.updated_at ?? stateComment.created_at;
+  if (typeof after !== 'string' || !after) return false;
+  for (const comment of comments) {
+    if (comment === stateComment) continue;
+    if (!comment.user?.login || isBot(comment.user)) continue;
+    const at = comment.created_at;
+    if (typeof at === 'string' && at > after) return true;
+  }
+  return false;
+}
+
+/**
+ * True when the PR should carry the configured ready label. A completed
+ * review at this head is required; the agent's ready line is not.
+ * Missing or stale state never qualifies. When the agent already said
+ * ready, PR-wide minors do not block. When it said needs_work, every
+ * PR-wide concern must have a later human issue comment.
+ */
 export function wantReadyLabel(args: {
   readonly prState: string;
   readonly draft: boolean;
   readonly headSha: string;
   readonly state: ReadyState | undefined;
   readonly threadsOk: boolean;
+  readonly prWideOk: boolean;
 }): boolean {
   if (args.prState !== 'open' || args.draft) return false;
-  if (!args.state?.ready) return false;
+  if (!args.state) return false;
   if (args.state.headPrefix !== args.headSha.slice(0, 10).toLowerCase()) return false;
-  return args.threadsOk;
+  if (!args.threadsOk) return false;
+  return args.state.ready || args.prWideOk;
 }
 
 /**
@@ -141,45 +210,96 @@ export function threadsAddressed(
   return true;
 }
 
+function sameHead(a: PullSnapshot, b: PullSnapshot): boolean {
+  return a.headSha === b.headSha && a.state === b.state && a.draft === b.draft;
+}
+
+function hasLabel(pull: PullSnapshot, label: string): boolean {
+  return pull.labels.some((name) => name.toLowerCase() === label.toLowerCase());
+}
+
 export async function reconcileReadyLabel(deps: ReconcileDeps): Promise<string> {
   const log = deps.log ?? ((line: string) => console.log(line));
   const warn = deps.warn ?? ((line: string) => console.warn(line));
   const { repo, prNumber, label } = deps;
 
-  const pull = await fetchPull(deps.api, repo, prNumber);
-  const comments = await listIssueComments(deps.api, repo, prNumber);
-  const stateComment = findAppStateComment(comments, deps.botLogin, deps.appId);
-  const state = stateComment ? parseReadyState(stateComment.body ?? '') : undefined;
-  const threads = await listReviewThreads(deps.graphql, repo, prNumber);
-  const threadsOk = threadsAddressed(threads, deps.botLogin, deps.isBot);
-  const want = wantReadyLabel({
-    prState: pull.state,
-    draft: pull.draft,
-    headSha: pull.headSha,
-    state,
-    threadsOk,
-  });
-  const has = pull.labels.some((name) => name.toLowerCase() === label.toLowerCase());
+  for (let attempt = 1; attempt <= MAX_RECONCILE_ATTEMPTS; attempt++) {
+    const pull = await fetchPull(deps.api, repo, prNumber);
+    const comments = await listIssueComments(deps.api, repo, prNumber);
+    const stateComment = findAppStateComment(comments, deps.botLogin, deps.appId);
+    const body = stateComment?.body ?? '';
+    const state = stateComment ? parseReadyState(body) : undefined;
+    const threads = await listReviewThreads(deps.graphql, repo, prNumber);
+    const threadsOk = threadsAddressed(threads, deps.botLogin, deps.isBot);
+    const prWideOk = !stateComment
+      || !openPrWideConcerns(body)
+      || humanAnsweredAfter(comments, stateComment, deps.isBot);
+    const want = wantReadyLabel({
+      prState: pull.state,
+      draft: pull.draft,
+      headSha: pull.headSha,
+      state,
+      threadsOk,
+      prWideOk,
+    });
 
-  let decision: string;
-  if (want && has) {
-    decision = 'already-on';
-  } else if (want && !has) {
-    const added = await addLabel(deps.api, repo, prNumber, label);
-    decision = added;
-  } else if (!want && has) {
-    await removeLabel(deps.api, repo, prNumber, label);
-    decision = 'removed';
-  } else {
-    decision = 'already-off';
+    const latest = await fetchPull(deps.api, repo, prNumber);
+    if (!sameHead(pull, latest)) {
+      log(`[ready-label] repo=${repo} pr=${prNumber} stale-head attempt=${attempt}`);
+      continue;
+    }
+
+    const has = hasLabel(latest, label);
+    let decision: string;
+    let mutated = false;
+    if (want && has) {
+      decision = 'already-on';
+    } else if (want && !has) {
+      decision = await addLabel(deps.api, repo, prNumber, label);
+      mutated = decision === 'added' || decision === 'missing-label';
+    } else if (!want && has) {
+      await removeLabel(deps.api, repo, prNumber, label);
+      decision = 'removed';
+      mutated = true;
+    } else {
+      decision = 'already-off';
+    }
+
+    if (mutated) {
+      const after = await fetchPull(deps.api, repo, prNumber);
+      if (!sameHead(pull, after)) {
+        log(`[ready-label] repo=${repo} pr=${prNumber} stale-head after ${decision} attempt=${attempt}`);
+        continue;
+      }
+    }
+
+    if (decision === 'missing-label') {
+      warn(`[ready-label] repo=${repo} pr=${prNumber} missing-label=${JSON.stringify(label)}`);
+    } else {
+      log(`[ready-label] repo=${repo} pr=${prNumber} want=${want} decision=${decision}`);
+    }
+    return decision;
   }
 
-  if (decision === 'missing-label') {
-    warn(`[ready-label] repo=${repo} pr=${prNumber} missing-label=${JSON.stringify(label)}`);
-  } else {
-    log(`[ready-label] repo=${repo} pr=${prNumber} want=${want} decision=${decision}`);
+  warn(`[ready-label] repo=${repo} pr=${prNumber} stale-head after ${MAX_RECONCILE_ATTEMPTS} attempts`);
+  return 'stale-head';
+}
+
+/**
+ * Logs an operational failure and rethrows so an async Lambda invoke
+ * retries it. Validation refusals (`{ error }`) resolve as success and
+ * must not be thrown.
+ */
+export async function runReadyLabelHandler(
+  apply: (event: ReadyLabelEvent) => Promise<ReadyLabelResult>,
+  event: ReadyLabelEvent,
+): Promise<ReadyLabelResult> {
+  try {
+    return await apply(event);
+  } catch (err) {
+    console.error('[ready-label] failed', err);
+    throw err;
   }
-  return decision;
 }
 
 export function createReadyLabelApplier(deps: ReadyLabelDeps): (event: ReadyLabelEvent) => Promise<ReadyLabelResult> {
@@ -187,8 +307,9 @@ export function createReadyLabelApplier(deps: ReadyLabelDeps): (event: ReadyLabe
   const log = deps.log ?? console.log;
   const warn = deps.warn ?? console.warn;
   const isBot = botMatcher(deps.botLogin, deps.knownBotLogins);
+  const chain = new Map<string, Promise<void>>();
 
-  return async (event) => {
+  const applyOne = async (event: ReadyLabelEvent): Promise<ReadyLabelResult> => {
     const installationId = Number(event.installation_id);
     const repo = typeof event.repo === 'string' ? event.repo : '';
     const prNumber = Number(event.pr_number);
@@ -235,6 +356,28 @@ export function createReadyLabelApplier(deps: ReadyLabelDeps): (event: ReadyLabe
     });
     return { ok: true, decision };
   };
+
+  return async (event) => {
+    const repo = typeof event.repo === 'string' ? event.repo.toLowerCase() : '';
+    const prNumber = Number(event.pr_number);
+    const key = Number.isSafeInteger(prNumber) && prNumber > 0 && repo.includes('/')
+      ? `${repo}#${prNumber}`
+      : '';
+    if (!key) return applyOne(event);
+
+    const prev = chain.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => { release = resolve; });
+    const tail = prev.then(() => mine, () => mine);
+    chain.set(key, tail);
+    try {
+      await prev;
+      return await applyOne(event);
+    } finally {
+      release();
+      if (chain.get(key) === tail) chain.delete(key);
+    }
+  };
 }
 
 function labelForRepo(labelsByRepo: Readonly<Record<string, string>>, repo: string): string | undefined {
@@ -257,12 +400,7 @@ function findAppStateComment(comments: readonly IssueComment[], botLogin: string
   return found;
 }
 
-async function fetchPull(api: GitHubApi, repo: string, prNumber: number): Promise<{
-  state: string;
-  draft: boolean;
-  headSha: string;
-  labels: readonly string[];
-}> {
+async function fetchPull(api: GitHubApi, repo: string, prNumber: number): Promise<PullSnapshot> {
   const { status, json } = await api('GET', `repos/${repo}/pulls/${prNumber}`);
   if (status !== 200) throw new Error(`GET repos/${repo}/pulls/${prNumber} returned ${status}`);
   const pr = json as {

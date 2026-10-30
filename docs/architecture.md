@@ -64,12 +64,15 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
 5. The model ends with `post_review` (a `COMMENT` review with inline
    comments) or `skip_review`. Both rewrite the pull request's review state
    comment. After a successful write, the runtime invokes the ready-label
-   Lambda when `READY_LABEL_FUNCTION` is set. New commits, draft/close
-   transitions, thread resolve/unresolve and a human reply on a review
-   comment also invoke it from the receiver. The function adds the
-   configured label only when the PR is open and not a draft, the state
-   comment says ready at this head, and every thread this App started is
-   resolved or has a later human reply; otherwise it removes that label.
+   Lambda when `READY_LABEL_FUNCTION` is set. New commits, draft/close/
+   reopen, thread resolve/unresolve, a human reply on a review comment
+   (created or deleted), and an issue comment on the pull request also
+   invoke it from the receiver, including when review routing returned
+   500. The function adds the configured label when the PR is open and
+   not a draft, this App has a completed review at the current head,
+   every thread this App started is resolved or has a later human reply,
+   and any PR-wide concern has been answered; the agent may still say
+   needs_work. Otherwise it removes that label.
 6. The runtime marks the heartbeat `completed` and sends a `done` event, and
    SQS deletes the message. If the worker's 15 minute limit ends its read
    first, later receives of the message decide from the heartbeat whether to
@@ -738,8 +741,11 @@ receiver may invoke. It never returns a token. The payload is
 as the token broker, then mints `issues: write`, `pull_requests: read` and
 `metadata: read` (`LABEL_PERMISSIONS` in `webhook/src/ready-label.ts`) and
 adds or removes that one label. A missing repository label is logged
-(`missing-label`) and not created. Failed GitHub calls never fail the
-webhook or the review.
+(`missing-label`) and not created. Failed GitHub or Secrets Manager
+calls reject the Lambda invoke so the async Event retry can run them
+again; they never fail the webhook or the review. An older reconcile
+that raced a push re-reads the head before and after a mutation and
+does not leave the label on the new commit.
 
 The reviewer token stays `pull_requests: write` + `metadata: read`. Pull
 request code that steals it cannot label arbitrary issues.

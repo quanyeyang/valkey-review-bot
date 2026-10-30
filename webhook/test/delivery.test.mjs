@@ -943,14 +943,16 @@ test('synchronize still queues the review and reconciles the ready label', async
   assert.deepEqual(readyLabel, [{ installationId: 42, repo: REPO, prNumber: 7 }]);
 });
 
-test('opened does not reconcile the ready label; closed, draft and ready_for_review do', async () => {
+test('opened does not reconcile the ready label; closed, draft, ready_for_review and reopened do', async () => {
   const { handler, readyLabel } = setup({ env: READY_ENV });
   await handler(delivery('pull_request', prEvent('opened')));
   assert.deepEqual(readyLabel, []);
   await handler(delivery('pull_request', prEvent('closed')));
   await handler(delivery('pull_request', prEvent('converted_to_draft')));
   await handler(delivery('pull_request', prEvent('ready_for_review')));
+  await handler(delivery('pull_request', prEvent('reopened')));
   assert.deepEqual(readyLabel, [
+    { installationId: 42, repo: REPO, prNumber: 7 },
     { installationId: 42, repo: REPO, prNumber: 7 },
     { installationId: 42, repo: REPO, prNumber: 7 },
     { installationId: 42, repo: REPO, prNumber: 7 },
@@ -1003,6 +1005,55 @@ test('a failed ready-label invoke does not 500 the webhook', async () => {
 test('a human review-comment reply reconciles the ready label', async () => {
   const { handler, readyLabel } = setup({ env: READY_ENV, github: parentBy(BOT) });
   await handler(delivery('pull_request_review_comment', reviewReply()));
+  assert.deepEqual(readyLabel, [{ installationId: 42, repo: REPO, prNumber: 7 }]);
+});
+
+test('deleting a review comment reconciles the ready label and is not curator feedback', async () => {
+  const { handler, sent, readyLabel } = setup({ env: READY_ENV, github: parentBy(BOT) });
+  await handler(delivery('pull_request_review_comment', reviewReply()));
+  const deleted = await handler(delivery('pull_request_review_comment', { ...reviewReply(), action: 'deleted' }));
+  assert.equal(body(deleted).skipped, 'not-feedback:action=deleted');
+  assert.equal(sent.length, 1, 'only the created reply reached the curator');
+  assert.equal(readyLabel.length, 2);
+});
+
+test('an issue comment on a pull request reconciles the ready label; a plain issue does not', async () => {
+  const { handler, readyLabel } = setup({ env: READY_ENV });
+  await handler(delivery('issue_comment', {
+    action: 'created', installation: { id: 42 }, repository: { full_name: REPO },
+    issue: { number: 7, pull_request: {}, user: { login: 'author' } },
+    comment: { id: 9, body: 'Disagree with the DCO finding; the commits are signed.', user: { login: 'maintainer' }, author_association: 'MEMBER' },
+  }));
+  assert.deepEqual(readyLabel, [{ installationId: 42, repo: REPO, prNumber: 7 }]);
+  await handler(delivery('issue_comment', {
+    action: 'deleted', installation: { id: 42 }, repository: { full_name: REPO },
+    issue: { number: 7, pull_request: {}, user: { login: 'author' } },
+    comment: { id: 9, body: 'Disagree with the DCO finding; the commits are signed.', user: { login: 'maintainer' }, author_association: 'MEMBER' },
+  }));
+  assert.equal(readyLabel.length, 2);
+  const before = readyLabel.length;
+  await handler(delivery('issue_comment', {
+    action: 'created', installation: { id: 42 }, repository: { full_name: REPO },
+    issue: { number: 3, user: { login: 'author' } },
+    comment: { id: 10, body: 'A comment on a plain issue that is long enough.', user: { login: 'maintainer' }, author_association: 'OWNER' },
+  }));
+  assert.equal(readyLabel.length, before);
+});
+
+test('a failed enqueue on synchronize still reconciles the ready label', async () => {
+  const { handler, readyLabel } = setup({
+    env: READY_ENV,
+    sendMessage: async () => { throw new Error('queue unavailable'); },
+  });
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const resp = await handler(delivery('pull_request', push('bbb')));
+    assert.equal(resp.statusCode, 500);
+    assert.deepEqual(body(resp), { error: 'internal' });
+  } finally {
+    console.error = original;
+  }
   assert.deepEqual(readyLabel, [{ installationId: 42, repo: REPO, prNumber: 7 }]);
 });
 

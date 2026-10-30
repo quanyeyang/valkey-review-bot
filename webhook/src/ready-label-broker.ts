@@ -2,7 +2,9 @@ import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-sec
 import { createAppAuth } from '@octokit/auth-app';
 import { parseKnownBotLogins } from './config.js';
 import { githubApi, githubGraphql } from './github.js';
-import { createReadyLabelApplier, type ReadyLabelEvent, type ReadyLabelResult } from './ready-label.js';
+import {
+  createReadyLabelApplier, runReadyLabelHandler, type ReadyLabelEvent, type ReadyLabelResult,
+} from './ready-label.js';
 
 /**
  * Ready-label Lambda.
@@ -21,7 +23,8 @@ import { createReadyLabelApplier, type ReadyLabelEvent, type ReadyLabelResult } 
  * Env:    GITHUB_SECRET_ARN, GITHUB_APP_ID, BOT_LOGIN, ALLOWED_REPOS_JSON,
  *         READY_LABEL_BY_REPO_JSON, optional KNOWN_BOT_LOGINS
  * Input:  { installation_id, repo, pr_number }
- * Output: { ok, decision } or { error }
+ * Output: { ok, decision } or { error }. Validation refusals resolve;
+ *         GitHub and Secrets Manager failures reject so Lambda retries.
  */
 
 function required(name: string): string {
@@ -102,10 +105,5 @@ const apply = createReadyLabelApplier({
 });
 
 export async function handler(event: ReadyLabelEvent): Promise<ReadyLabelResult> {
-  try {
-    return await apply(event);
-  } catch (err) {
-    console.error('[ready-label] failed', err);
-    return { error: 'internal' };
-  }
+  return runReadyLabelHandler(apply, event);
 }

@@ -32,9 +32,12 @@ import { releaseQuietly, type DeliveryStore } from './store.js';
  *      curator queue.
  *   4. After that routing, a ready-label reconcile is invoked (never a
  *      500) on pull_request synchronize/closed/converted_to_draft/
- *      ready_for_review, pull_request_review_thread resolved/unresolved,
- *      and pull_request_review_comment created. The thread event is not
- *      curator feedback.
+ *      ready_for_review/reopened, pull_request_review_thread
+ *      resolved/unresolved, pull_request_review_comment created/deleted,
+ *      and issue_comment created/deleted on a pull request. It still
+ *      runs when review routing returns 500: GitHub does not retry a
+ *      failed delivery, and a push that failed to queue must still drop
+ *      the ready label. The thread event is not curator feedback.
  *
  * Status codes: 401 for a bad signature, 400 for a payload this code
  * cannot use, 500 when the work could not be queued. GitHub does not
@@ -93,9 +96,10 @@ const FEEDBACK_EVENTS: ReadonlySet<string> = new Set(['issue_comment', 'pull_req
 const THREAD_EVENT = 'pull_request_review_thread';
 /** pull_request / thread / review-comment actions that can change the ready label. */
 const READY_LABEL_PULL_ACTIONS: ReadonlySet<string> = new Set([
-  'synchronize', 'closed', 'converted_to_draft', 'ready_for_review',
+  'synchronize', 'closed', 'converted_to_draft', 'ready_for_review', 'reopened',
 ]);
 const READY_LABEL_THREAD_ACTIONS: ReadonlySet<string> = new Set(['resolved', 'unresolved']);
+const READY_LABEL_COMMENT_ACTIONS: ReadonlySet<string> = new Set(['created', 'deleted']);
 /** The pull_request actions that start an automatic review, and the trigger each sends. */
 const REVIEW_TRIGGERS: ReadonlyMap<string, AutomaticTrigger> = new Map([
   ['opened', 'opened'],
@@ -513,15 +517,17 @@ export function createDeliveryHandler(
 
   /**
    * After review/mention routing. Never raises into the delivery: a
-   * failed invoke is logged and the delivery's status stands. A 500 from
-   * mention or queuing is returned before this runs.
+   * failed invoke is logged and the delivery's status stands. Runs even
+   * when routing returned 500, so a queue failure on push still drops
+   * a stale ready label.
    */
   async function maybeSyncReadyLabel(eventType: string, payload: WebhookPayload, target: Target): Promise<void> {
     if (!deps.syncReadyLabel) return;
     const action = payload.action ?? '';
     const sync = (eventType === 'pull_request' && READY_LABEL_PULL_ACTIONS.has(action))
       || (eventType === THREAD_EVENT && READY_LABEL_THREAD_ACTIONS.has(action))
-      || (eventType === 'pull_request_review_comment' && action === 'created');
+      || (eventType === 'pull_request_review_comment' && READY_LABEL_COMMENT_ACTIONS.has(action))
+      || (eventType === 'issue_comment' && READY_LABEL_COMMENT_ACTIONS.has(action) && payload.issue?.pull_request);
     if (!sync) return;
     const prNumber = payload.pull_request?.number ?? payload.issue?.number;
     if (typeof prNumber !== 'number') return;
@@ -546,38 +552,40 @@ export function createDeliveryHandler(
     if (typeof installationId !== 'number') return fail(400, 'missing-installation');
     const target = { repo, installationId };
 
-    if (eventType === 'pull_request') {
-      const outcome = await pullRequest(payload, target);
-      if (outcome.status < 500) await maybeSyncReadyLabel(eventType, payload, target);
-      return outcome;
-    }
-
-    // Thread resolve/unresolve never starts a review and is not curator
-    // feedback; it only recomputes the ready label.
-    if (eventType === THREAD_EVENT) {
-      const outcome = skip(`action=${payload.action ?? ''}`);
-      if (outcome.status < 500) await maybeSyncReadyLabel(eventType, payload, target);
-      return outcome;
-    }
-
-    // A summons is a command, not feedback: it ends here. A thread reply
-    // may start a re-review and then still goes to the curator.
-    const m = detectMention(eventType, payload, { botLogin: config.botLogin, isBotAuthor });
-    if (m) {
-      const route = config.reviewRoutes.get(repo.toLowerCase());
-      if (m.kind === 'summon') {
-        const outcome = route ? await mention(m, route, target) : skip(`mention:unrouted-repo=${repo}`);
-        if (outcome.status < 500) await maybeSyncReadyLabel(eventType, payload, target);
-        return outcome;
+    let outcome: Outcome;
+    try {
+      if (eventType === 'pull_request') {
+        outcome = await pullRequest(payload, target);
+      } else if (eventType === THREAD_EVENT) {
+        // Thread resolve/unresolve never starts a review and is not curator
+        // feedback; it only recomputes the ready label.
+        outcome = skip(`action=${payload.action ?? ''}`);
+      } else {
+        // A summons is a command, not feedback: it ends here. A thread reply
+        // may start a re-review and then still goes to the curator.
+        const m = detectMention(eventType, payload, { botLogin: config.botLogin, isBotAuthor });
+        if (m) {
+          const route = config.reviewRoutes.get(repo.toLowerCase());
+          if (m.kind === 'summon') {
+            outcome = route ? await mention(m, route, target) : skip(`mention:unrouted-repo=${repo}`);
+          } else if (route?.threadReplyReview) {
+            outcome = await mention(m, route, target);
+            if (outcome.status < 500) {
+              log(`[mention] repo=${repo} pr=${m.prNumber} decision=${decisionOf(outcome)}`);
+              outcome = await feedback(eventType, payload, target);
+            }
+          } else {
+            outcome = await feedback(eventType, payload, target);
+          }
+        } else {
+          outcome = await feedback(eventType, payload, target);
+        }
       }
-      if (route?.threadReplyReview) {
-        const outcome = await mention(m, route, target);
-        if (outcome.status >= 500) return outcome;
-        log(`[mention] repo=${repo} pr=${m.prNumber} decision=${decisionOf(outcome)}`);
-      }
+    } catch (err) {
+      console.error('[receiver] delivery failed', err);
+      outcome = fail(500, 'internal');
     }
-    const outcome = await feedback(eventType, payload, target);
-    if (outcome.status < 500) await maybeSyncReadyLabel(eventType, payload, target);
+    await maybeSyncReadyLabel(eventType, payload, target);
     return outcome;
   }
 

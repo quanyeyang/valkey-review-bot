@@ -100,7 +100,7 @@ redelivered from the App's advanced settings.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `REVIEW_ROUTE_MAP_JSON` | required | Review routes keyed by repository full name: `{ routeId, queueUrl, reviewerId, authorAllowlist?, mentionOnly?, skipDrafts?, threadReplyReview?, readyLabel? }`. |
-| `READY_LABEL_FUNCTION` | none | Ready-label Lambda. Unset when no route sets `readyLabel`. The receiver invokes it asynchronously after `synchronize` / `closed` / `converted_to_draft` / `ready_for_review`, `pull_request_review_thread` resolved/unresolved, and `pull_request_review_comment` created. A failed invoke is logged and never returns 500. |
+| `READY_LABEL_FUNCTION` | none | Ready-label Lambda. Unset when no route sets `readyLabel`. The receiver invokes it asynchronously after `synchronize` / `closed` / `converted_to_draft` / `ready_for_review` / `reopened`, `pull_request_review_thread` resolved/unresolved, `pull_request_review_comment` created/deleted, and `issue_comment` created/deleted on a pull request. The invoke still runs when review routing returned 500. A failed invoke is logged and never returns 500. |
 | `CURATOR_ROUTE_MAP_JSON` | `{}` | Repositories whose feedback reaches the curator, keyed by full name: `{ reviewerId }`. |
 | `CURATOR_QUEUE_URL` | empty | Curator queue. Empty means feedback is not forwarded. |
 | `IDEMPOTENCY_TABLE` | required | DynamoDB table keyed by `key`, with TTL attribute `ttl`. Holds delivery keys (24 hours), the daily review counters `budget#ROUTEID#YYYY-MM-DD` (UTC, 3 days), the round counters `autoreviews#owner/name#pr` (180 days from the latest automatic review) and the pending markers `pending#owner/name#pr` (an hour after the queue delay). |
@@ -212,7 +212,9 @@ the sticky state comment (`<!-- valkey-reviewer:state -->`) and this App's
 review threads, and adds or removes the label named in
 `READY_LABEL_BY_REPO_JSON`. The token is never returned. A 404 when adding
 the label means the operator has not created it in the repository
-(`missing-label`); the function does not create labels.
+(`missing-label`); the function does not create labels. Validation
+refusals resolve as `{ error }`. Operational failures (GitHub, Secrets
+Manager) reject the invoke so Lambda retries the async Event.
 
 The App needs Issues (write) and a webhook subscription to
 `pull_request_review_thread`. Approve the new permission on each

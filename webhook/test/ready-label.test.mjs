@@ -7,8 +7,8 @@ import './support/ts-resolve.mjs';
 import { fakeGitHub } from './support/fakes.mjs';
 
 const {
-  LABEL_PERMISSIONS, STATE_MARKER, createReadyLabelApplier, parseReadyState, reconcileReadyLabel,
-  threadsAddressed, wantReadyLabel,
+  LABEL_PERMISSIONS, STATE_MARKER, createReadyLabelApplier, humanAnsweredAfter, openPrWideConcerns,
+  parseReadyState, reconcileReadyLabel, runReadyLabelHandler, threadsAddressed, wantReadyLabel,
 } = await import('../src/ready-label.ts');
 const { botMatcher } = await import('../src/config.ts');
 
@@ -32,11 +32,32 @@ function stateBody({ ready = true, sha = HEAD } = {}) {
 }
 
 function appComment(overrides = {}) {
-  const { ready = true, sha = HEAD, login = BOT, appId = APP_ID, body } = overrides;
+  const {
+    ready = true, sha = HEAD, login = BOT, appId = APP_ID, body,
+    created_at = '2026-10-01T12:00:00Z', updated_at = '2026-10-01T12:34:00Z',
+  } = overrides;
   return {
     body: body ?? stateBody({ ready, sha }),
     user: { login, type: login.endsWith('[bot]') ? 'Bot' : 'User' },
     performed_via_github_app: { id: appId },
+    created_at,
+    updated_at,
+  };
+}
+
+function needsWorkPrWide({ sha = HEAD, direction = false } = {}) {
+  const findings = direction
+    ? '**Open findings:** none.\n\n**Backport:** Not needed. x\n\n**Direction**\nUse a pool instead.\n'
+    : '**Open findings (1)**\n- DCO is missing.\n\n**Backport:** Not needed. x\n';
+  return `${STATE_MARKER}\n### Review state\n\n**Not ready for human review yet.**\nOne blocking finding is open.\n\n**Risk:** High. x\n\n${findings}\n<sub>Updated for ${sha.slice(0, 10)} at 2026-10-01 12:34 UTC. The bot rewrites this comment on every review.</sub>`;
+}
+
+function humanIssueComment({ created_at = '2026-10-01T13:00:00Z', login = 'maintainer' } = {}) {
+  return {
+    body: 'Disagree: the DCO is on the commits.',
+    user: { login, type: 'User' },
+    created_at,
+    updated_at: created_at,
   };
 }
 
@@ -153,15 +174,38 @@ test('parseReadyState reads the renderer\'s ready line and 10-hex head prefix', 
   assert.equal(parseReadyState(`${STATE_MARKER}\n**Ready for human review.**`), undefined);
 });
 
-test('wantReadyLabel requires an open non-draft PR, ready state at this head, and addressed threads', () => {
-  const ok = { prState: 'open', draft: false, headSha: HEAD, state: { ready: true, headPrefix: PREFIX }, threadsOk: true };
+test('wantReadyLabel requires an open non-draft PR, a completed review at this head, and addressed findings', () => {
+  const ok = {
+    prState: 'open', draft: false, headSha: HEAD,
+    state: { ready: true, headPrefix: PREFIX }, threadsOk: true, prWideOk: true,
+  };
   assert.equal(wantReadyLabel(ok), true);
   assert.equal(wantReadyLabel({ ...ok, prState: 'closed' }), false);
   assert.equal(wantReadyLabel({ ...ok, draft: true }), false);
-  assert.equal(wantReadyLabel({ ...ok, state: { ready: false, headPrefix: PREFIX } }), false);
+  assert.equal(wantReadyLabel({ ...ok, state: { ready: false, headPrefix: PREFIX } }), true);
+  assert.equal(wantReadyLabel({ ...ok, state: { ready: false, headPrefix: PREFIX }, prWideOk: false }), false);
+  assert.equal(wantReadyLabel({ ...ok, prWideOk: false }), true, 'ready does not wait on PR-wide minors');
   assert.equal(wantReadyLabel({ ...ok, state: { ready: true, headPrefix: 'aaaaaaaaaa' } }), false);
   assert.equal(wantReadyLabel({ ...ok, state: undefined }), false);
   assert.equal(wantReadyLabel({ ...ok, threadsOk: false }), false);
+});
+
+test('openPrWideConcerns follows the renderer\'s PR-wide lines and Direction', () => {
+  assert.match(reviewStateSrc, /const where = location \? /);
+  assert.match(reviewStateSrc, /\*\*Direction\*\*/);
+  assert.equal(openPrWideConcerns(stateBody({ ready: true })), false);
+  assert.equal(openPrWideConcerns(stateBody({ ready: false })), false);
+  assert.equal(openPrWideConcerns(needsWorkPrWide()), true);
+  assert.equal(openPrWideConcerns(needsWorkPrWide({ direction: true })), true);
+  assert.equal(openPrWideConcerns(`${STATE_MARKER}\n**Open findings (1)**\n- \`src/server.c:10\` Leak.\n`), false);
+});
+
+test('humanAnsweredAfter counts a non-bot issue comment created after the state rewrite', () => {
+  const state = appComment();
+  assert.equal(humanAnsweredAfter([state], state, isBot), false);
+  assert.equal(humanAnsweredAfter([state, humanIssueComment()], state, isBot), true);
+  assert.equal(humanAnsweredAfter([state, humanIssueComment({ created_at: '2026-10-01T12:00:00Z' })], state, isBot), false);
+  assert.equal(humanAnsweredAfter([state, humanIssueComment({ login: BOT })], state, isBot), false);
 });
 
 test('threadsAddressed: resolve or a later human reply; bot-only does not; other bots\' threads are ignored', () => {
@@ -197,14 +241,49 @@ test('an open ready PR at this head with no unaddressed threads gets the label',
   assert.deepEqual(post.body, { labels: [LABEL] });
 });
 
-test('a Not ready state comment removes the label', async () => {
+test('unanswered findings at this head remove the label even when the agent still says needs_work', async () => {
   const { decision, api } = await reconcile({
     pull: pullJson({ labels: [LABEL] }),
     comments: [appComment({ ready: false })],
+    graphql: threadsData([thread({ authors: [BOT] })]),
   });
   assert.equal(decision, 'removed');
   assert.ok(api.calls.some((c) => c.method === 'DELETE'));
   assert.ok(!api.calls.some((c) => c.method === 'POST'));
+});
+
+test('a human reply on this App\'s thread adds the label while the agent still says needs_work', async () => {
+  const { decision, api } = await reconcile({
+    comments: [appComment({ ready: false })],
+    graphql: threadsData([thread({ authors: [BOT, 'maintainer'] })]),
+  });
+  assert.equal(decision, 'added');
+  assert.ok(api.calls.some((c) => c.method === 'POST'));
+});
+
+test('a later human issue comment addresses a PR-wide finding', async () => {
+  const { decision } = await reconcile({
+    comments: [appComment({ ready: false, body: needsWorkPrWide() }), humanIssueComment()],
+  });
+  assert.equal(decision, 'added');
+});
+
+test('a PR-wide finding with no later human comment does not get the label', async () => {
+  const { decision, api } = await reconcile({
+    comments: [appComment({ ready: false, body: needsWorkPrWide() })],
+  });
+  assert.equal(decision, 'already-off');
+  assert.ok(!api.calls.some((c) => c.method === 'POST'));
+});
+
+test('a human comment from before the state rewrite does not address a PR-wide finding', async () => {
+  const { decision } = await reconcile({
+    comments: [
+      appComment({ ready: false, body: needsWorkPrWide() }),
+      humanIssueComment({ created_at: '2026-10-01T12:00:00Z' }),
+    ],
+  });
+  assert.equal(decision, 'already-off');
 });
 
 test('a ready comment for another head is not this head', async () => {
@@ -294,4 +373,82 @@ test('refuses a malformed request without calling GitHub', async () => {
   assert.deepEqual(await apply({ repo: REPO, pr_number: 7 }), { error: 'invalid installation_id' });
   assert.deepEqual(await apply({ installation_id: INSTALLATION, repo: 'valkey', pr_number: 7 }), { error: 'repo must be "owner/name"' });
   assert.deepEqual(api.calls, []);
+});
+
+test('a stale invocation does not add the label after a newer head has been reconciled', async () => {
+  const headB = 'bbbbbbbbbb0123456789deadbeefcafebabe00000000';
+  let sha = HEAD;
+  const labels = [];
+  let resolveGraphql;
+  const blocked = new Promise((r) => { resolveGraphql = r; });
+  let graphqlCalls = 0;
+  const api = fakeGitHub({
+    [`GET repos/${REPO}/pulls/7`]: () => pullJson({ sha, labels: [...labels] }),
+    [`GET repos/${REPO}/issues/7/comments?per_page=100&page=1`]: { status: 200, json: [appComment()] },
+    [`POST repos/${REPO}/issues/7/labels`]: () => {
+      labels.push(LABEL);
+      return { status: 200, json: {} };
+    },
+    [`DELETE repos/${REPO}/issues/7/labels/${encodeURIComponent(LABEL)}`]: () => {
+      labels.splice(0);
+      return { status: 200, json: {} };
+    },
+  });
+  const run = () => reconcileReadyLabel({
+    api,
+    graphql: async () => {
+      graphqlCalls += 1;
+      if (graphqlCalls === 1) await blocked;
+      return threadsData([]);
+    },
+    repo: REPO, prNumber: 7, appId: APP_ID, botLogin: BOT, isBot, label: LABEL,
+    log() {}, warn() {},
+  });
+
+  const first = run();
+  for (let i = 0; i < 50 && graphqlCalls < 1; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(graphqlCalls, 1);
+
+  sha = headB;
+  assert.equal(await run(), 'already-off');
+  resolveGraphql();
+  assert.equal(await first, 'already-off');
+  assert.equal(api.calls.filter((c) => c.method === 'POST').length, 0);
+  assert.deepEqual(labels, []);
+});
+
+test('an add on a head that then moves is undone on the next attempt', async () => {
+  const headB = 'bbbbbbbbbb0123456789deadbeefcafebabe00000000';
+  const labels = [];
+  const shas = [HEAD, HEAD, headB, headB, headB];
+  const api = fakeGitHub({
+    [`GET repos/${REPO}/pulls/7`]: () => pullJson({ sha: shas.shift() ?? headB, labels: [...labels] }),
+    [`GET repos/${REPO}/issues/7/comments?per_page=100&page=1`]: { status: 200, json: [appComment()] },
+    [`POST repos/${REPO}/issues/7/labels`]: () => {
+      labels.push(LABEL);
+      return { status: 200, json: {} };
+    },
+    [`DELETE repos/${REPO}/issues/7/labels/${encodeURIComponent(LABEL)}`]: () => {
+      labels.splice(0);
+      return { status: 200, json: {} };
+    },
+  });
+  const decision = await reconcileReadyLabel({
+    api, graphql: async () => threadsData([]),
+    repo: REPO, prNumber: 7, appId: APP_ID, botLogin: BOT, isBot, label: LABEL,
+    log() {}, warn() {},
+  });
+  assert.equal(decision, 'removed');
+  assert.ok(api.calls.some((c) => c.method === 'POST'));
+  assert.ok(api.calls.some((c) => c.method === 'DELETE'));
+  assert.deepEqual(labels, []);
+});
+
+test('operational failures reject so Lambda retries; validation errors resolve', async () => {
+  const handler = (event) => runReadyLabelHandler(async (e) => {
+    if (e.pr_number === 'boom') throw new Error('ServiceUnavailableException');
+    return { error: 'invalid pr_number' };
+  }, event);
+  await assert.rejects(() => handler({ pr_number: 'boom' }), /ServiceUnavailableException/);
+  assert.deepEqual(await handler({}), { error: 'invalid pr_number' });
 });
