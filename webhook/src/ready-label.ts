@@ -17,10 +17,13 @@ import { fetchRepoInstallation, type GitHubApi } from './github.js';
  * never count. Anything else removes the label if it is present. The
  * label is never created.
  *
- * Before a mutation the head is fetched again, and after one it is
- * fetched again: an older invocation that raced a push cannot leave the
- * label on the new head. Overlapping applies for the same PR on one
- * isolate run one at a time.
+ * Before a mutation the head is fetched again. After one, the head,
+ * comments and threads are fetched again: a resolve that races an
+ * unresolve (or a reply that races a deletion) must not leave the
+ * label on. ReadyLabelFn runs with reserved concurrency 1 so async
+ * invokes for every PR are serialized; a throttled Event is retried.
+ * If attempts run out after an add, the label is removed before
+ * returning stale-head.
  */
 
 /** Identical to agents/common/src/review-state.ts. Tests parse that renderer. */
@@ -28,8 +31,8 @@ export const STATE_MARKER = '<!-- valkey-reviewer:state -->';
 
 export const LABEL_PERMISSIONS = { issues: 'write', pull_requests: 'read', metadata: 'read' } as const;
 
-/** Restarts when the head moves under a reconcile; then gives up without adding. */
-const MAX_RECONCILE_ATTEMPTS = 4;
+/** Restarts when the head or the predicate moves under a reconcile. */
+export const MAX_RECONCILE_ATTEMPTS = 4;
 
 export interface LabelTokenRequest {
   readonly installationId: number;
@@ -218,30 +221,36 @@ function hasLabel(pull: PullSnapshot, label: string): boolean {
   return pull.labels.some((name) => name.toLowerCase() === label.toLowerCase());
 }
 
+async function readWant(
+  deps: ReconcileDeps,
+  pull: PullSnapshot,
+): Promise<boolean> {
+  const comments = await listIssueComments(deps.api, deps.repo, deps.prNumber);
+  const stateComment = findAppStateComment(comments, deps.botLogin, deps.appId);
+  const body = stateComment?.body ?? '';
+  const state = stateComment ? parseReadyState(body) : undefined;
+  const threads = await listReviewThreads(deps.graphql, deps.repo, deps.prNumber);
+  return wantReadyLabel({
+    prState: pull.state,
+    draft: pull.draft,
+    headSha: pull.headSha,
+    state,
+    threadsOk: threadsAddressed(threads, deps.botLogin, deps.isBot),
+    prWideOk: !stateComment
+      || !openPrWideConcerns(body)
+      || humanAnsweredAfter(comments, stateComment, deps.isBot),
+  });
+}
+
 export async function reconcileReadyLabel(deps: ReconcileDeps): Promise<string> {
   const log = deps.log ?? ((line: string) => console.log(line));
   const warn = deps.warn ?? ((line: string) => console.warn(line));
   const { repo, prNumber, label } = deps;
+  let leftoverAdd = false;
 
   for (let attempt = 1; attempt <= MAX_RECONCILE_ATTEMPTS; attempt++) {
     const pull = await fetchPull(deps.api, repo, prNumber);
-    const comments = await listIssueComments(deps.api, repo, prNumber);
-    const stateComment = findAppStateComment(comments, deps.botLogin, deps.appId);
-    const body = stateComment?.body ?? '';
-    const state = stateComment ? parseReadyState(body) : undefined;
-    const threads = await listReviewThreads(deps.graphql, repo, prNumber);
-    const threadsOk = threadsAddressed(threads, deps.botLogin, deps.isBot);
-    const prWideOk = !stateComment
-      || !openPrWideConcerns(body)
-      || humanAnsweredAfter(comments, stateComment, deps.isBot);
-    const want = wantReadyLabel({
-      prState: pull.state,
-      draft: pull.draft,
-      headSha: pull.headSha,
-      state,
-      threadsOk,
-      prWideOk,
-    });
+    const want = await readWant(deps, pull);
 
     const latest = await fetchPull(deps.api, repo, prNumber);
     if (!sameHead(pull, latest)) {
@@ -257,8 +266,10 @@ export async function reconcileReadyLabel(deps: ReconcileDeps): Promise<string> 
     } else if (want && !has) {
       decision = await addLabel(deps.api, repo, prNumber, label);
       mutated = decision === 'added' || decision === 'missing-label';
+      leftoverAdd = decision === 'added';
     } else if (!want && has) {
       await removeLabel(deps.api, repo, prNumber, label);
+      leftoverAdd = false;
       decision = 'removed';
       mutated = true;
     } else {
@@ -267,8 +278,8 @@ export async function reconcileReadyLabel(deps: ReconcileDeps): Promise<string> 
 
     if (mutated) {
       const after = await fetchPull(deps.api, repo, prNumber);
-      if (!sameHead(pull, after)) {
-        log(`[ready-label] repo=${repo} pr=${prNumber} stale-head after ${decision} attempt=${attempt}`);
+      if (!sameHead(pull, after) || await readWant(deps, after) !== want) {
+        log(`[ready-label] repo=${repo} pr=${prNumber} stale after ${decision} attempt=${attempt}`);
         continue;
       }
     }
@@ -281,6 +292,7 @@ export async function reconcileReadyLabel(deps: ReconcileDeps): Promise<string> 
     return decision;
   }
 
+  if (leftoverAdd) await removeLabel(deps.api, repo, prNumber, label);
   warn(`[ready-label] repo=${repo} pr=${prNumber} stale-head after ${MAX_RECONCILE_ATTEMPTS} attempts`);
   return 'stale-head';
 }
@@ -307,9 +319,8 @@ export function createReadyLabelApplier(deps: ReadyLabelDeps): (event: ReadyLabe
   const log = deps.log ?? console.log;
   const warn = deps.warn ?? console.warn;
   const isBot = botMatcher(deps.botLogin, deps.knownBotLogins);
-  const chain = new Map<string, Promise<void>>();
 
-  const applyOne = async (event: ReadyLabelEvent): Promise<ReadyLabelResult> => {
+  return async (event) => {
     const installationId = Number(event.installation_id);
     const repo = typeof event.repo === 'string' ? event.repo : '';
     const prNumber = Number(event.pr_number);
@@ -355,28 +366,6 @@ export function createReadyLabelApplier(deps: ReadyLabelDeps): (event: ReadyLabe
       warn,
     });
     return { ok: true, decision };
-  };
-
-  return async (event) => {
-    const repo = typeof event.repo === 'string' ? event.repo.toLowerCase() : '';
-    const prNumber = Number(event.pr_number);
-    const key = Number.isSafeInteger(prNumber) && prNumber > 0 && repo.includes('/')
-      ? `${repo}#${prNumber}`
-      : '';
-    if (!key) return applyOne(event);
-
-    const prev = chain.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    const mine = new Promise<void>((resolve) => { release = resolve; });
-    const tail = prev.then(() => mine, () => mine);
-    chain.set(key, tail);
-    try {
-      await prev;
-      return await applyOne(event);
-    } finally {
-      release();
-      if (chain.get(key) === tail) chain.delete(key);
-    }
   };
 }
 

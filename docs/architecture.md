@@ -744,8 +744,12 @@ adds or removes that one label. A missing repository label is logged
 (`missing-label`) and not created. Failed GitHub or Secrets Manager
 calls reject the Lambda invoke so the async Event retry can run them
 again; they never fail the webhook or the review. An older reconcile
-that raced a push re-reads the head before and after a mutation and
-does not leave the label on the new commit.
+that raced a push re-reads the head before a mutation, and the head,
+comments and threads after one, so a resolve that races an unresolve
+(or a reply that races a deletion) does not leave the label on.
+ReadyLabelFn is reserved to one concurrent execution, which serializes
+async Event invokes; a throttled invoke is retried. If attempts run out
+after an add, the label is removed before returning `stale-head`.
 
 The reviewer token stays `pull_requests: write` + `metadata: read`. Pull
 request code that steals it cannot label arbitrary issues.

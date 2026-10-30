@@ -441,6 +441,10 @@ describe('ready label', () => {
       ALLOWED_REPOS_JSON: JSON.stringify(['example-org/valkey']),
       READY_LABEL_BY_REPO_JSON: JSON.stringify({ 'example-org/valkey': 'ready-for-human-review' }),
     });
+    const readyFns = Object.entries(substrate.findResources('AWS::Lambda::Function'))
+      .filter(([id]) => id.startsWith('ReadyLabelFn'));
+    expect(readyFns).toHaveLength(1);
+    expect((readyFns[0]![1] as any).Properties.ReservedConcurrentExecutions).toBe(1);
     expect(statementsForRole(substrate, functionRoleId(substrate, 'ReadyLabelFn')).flatMap(actionsOf))
       .toContain('secretsmanager:GetSecretValue');
 

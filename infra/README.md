@@ -800,6 +800,9 @@ limits, which are in the code named below:
 - Receiver: 10 reserved concurrent executions. Reserving concurrency needs
   enough unreserved account concurrency; a new account with a low Lambda
   quota may need an increase first.
+- Ready-label Lambda: 1 reserved concurrent execution when a route sets
+  `readyLabel`. Async Event invokes that arrive while it is busy are
+  throttled and retried. It shares the same unreserved pool as the receiver.
 - HTTP API: 20 requests per second, burst 40. GitHub does not retry a
   throttled delivery by itself; you can redeliver it from the App's
   advanced settings.

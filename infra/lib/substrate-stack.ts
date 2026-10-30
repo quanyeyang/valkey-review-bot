@@ -167,6 +167,9 @@ export class SubstrateStack extends cdk.Stack {
         architecture: lambda.Architecture.ARM_64,
         timeout: cdk.Duration.seconds(30),
         memorySize: 256,
+        // One isolate at a time: async Event invokes cannot overlap a POST
+        // with a DELETE on the same PR. A throttled Event is retried.
+        reservedConcurrentExecutions: 1,
         description: 'Projects this App\'s review readiness onto a configured pull request label.',
         environment: {
           GITHUB_SECRET_ARN: this.githubAppSecret.secretArn,

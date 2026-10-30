@@ -7,8 +7,9 @@ import './support/ts-resolve.mjs';
 import { fakeGitHub } from './support/fakes.mjs';
 
 const {
-  LABEL_PERMISSIONS, STATE_MARKER, createReadyLabelApplier, humanAnsweredAfter, openPrWideConcerns,
-  parseReadyState, reconcileReadyLabel, runReadyLabelHandler, threadsAddressed, wantReadyLabel,
+  LABEL_PERMISSIONS, MAX_RECONCILE_ATTEMPTS, STATE_MARKER, createReadyLabelApplier,
+  humanAnsweredAfter, openPrWideConcerns, parseReadyState, reconcileReadyLabel,
+  runReadyLabelHandler, threadsAddressed, wantReadyLabel,
 } = await import('../src/ready-label.ts');
 const { botMatcher } = await import('../src/config.ts');
 
@@ -442,6 +443,113 @@ test('an add on a head that then moves is undone on the next attempt', async () 
   assert.ok(api.calls.some((c) => c.method === 'POST'));
   assert.ok(api.calls.some((c) => c.method === 'DELETE'));
   assert.deepEqual(labels, []);
+});
+
+test('an add on the same head is undone when threads become unaddressed before the reconcile returns', async () => {
+  const labels = [];
+  let graphqlCalls = 0;
+  const api = fakeGitHub({
+    [`GET repos/${REPO}/pulls/7`]: () => pullJson({ sha: HEAD, labels: [...labels] }),
+    [`GET repos/${REPO}/issues/7/comments?per_page=100&page=1`]: { status: 200, json: [appComment()] },
+    [`POST repos/${REPO}/issues/7/labels`]: () => {
+      labels.push(LABEL);
+      return { status: 200, json: {} };
+    },
+    [`DELETE repos/${REPO}/issues/7/labels/${encodeURIComponent(LABEL)}`]: () => {
+      labels.splice(0);
+      return { status: 200, json: {} };
+    },
+  });
+  const decision = await reconcileReadyLabel({
+    api,
+    graphql: async () => {
+      graphqlCalls += 1;
+      return graphqlCalls === 1
+        ? threadsData([thread({ resolved: true })])
+        : threadsData([thread({ authors: [BOT] })]);
+    },
+    repo: REPO, prNumber: 7, appId: APP_ID, botLogin: BOT, isBot, label: LABEL,
+    log() {}, warn() {},
+  });
+  assert.equal(decision, 'removed');
+  assert.ok(api.calls.some((c) => c.method === 'POST'));
+  assert.ok(api.calls.some((c) => c.method === 'DELETE'));
+  assert.deepEqual(labels, []);
+});
+
+test('a paused resolve does not leave the label on after a later unresolve at the same head', async () => {
+  const labels = [];
+  let resolveGraphql;
+  const blocked = new Promise((r) => { resolveGraphql = r; });
+  let graphqlCalls = 0;
+  const resolved = threadsData([thread({ resolved: true })]);
+  const unresolved = threadsData([thread({ authors: [BOT] })]);
+  const api = fakeGitHub({
+    [`GET repos/${REPO}/pulls/7`]: () => pullJson({ sha: HEAD, labels: [...labels] }),
+    [`GET repos/${REPO}/issues/7/comments?per_page=100&page=1`]: { status: 200, json: [appComment()] },
+    [`POST repos/${REPO}/issues/7/labels`]: () => {
+      labels.push(LABEL);
+      return { status: 200, json: {} };
+    },
+    [`DELETE repos/${REPO}/issues/7/labels/${encodeURIComponent(LABEL)}`]: () => {
+      labels.splice(0);
+      return { status: 200, json: {} };
+    },
+  });
+  const run = () => reconcileReadyLabel({
+    api,
+    graphql: async () => {
+      graphqlCalls += 1;
+      if (graphqlCalls === 1) {
+        await blocked;
+        return resolved;
+      }
+      return unresolved;
+    },
+    repo: REPO, prNumber: 7, appId: APP_ID, botLogin: BOT, isBot, label: LABEL,
+    log() {}, warn() {},
+  });
+
+  const first = run();
+  for (let i = 0; i < 50 && graphqlCalls < 1; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(graphqlCalls, 1);
+
+  assert.equal(await run(), 'already-off');
+  resolveGraphql();
+  assert.equal(await first, 'removed');
+  assert.deepEqual(labels, []);
+  assert.equal(api.calls.filter((c) => c.method === 'POST').length, 1);
+  assert.ok(api.calls.some((c) => c.method === 'DELETE'));
+});
+
+test('an add on the last attempt is removed before returning stale-head', async () => {
+  const headB = 'bbbbbbbbbb0123456789deadbeefcafebabe00000000';
+  const labels = [];
+  const shas = [];
+  for (let i = 0; i < MAX_RECONCILE_ATTEMPTS - 1; i++) shas.push(HEAD, headB);
+  shas.push(HEAD, HEAD, headB);
+  const api = fakeGitHub({
+    [`GET repos/${REPO}/pulls/7`]: () => pullJson({ sha: shas.shift() ?? headB, labels: [...labels] }),
+    [`GET repos/${REPO}/issues/7/comments?per_page=100&page=1`]: { status: 200, json: [appComment()] },
+    [`POST repos/${REPO}/issues/7/labels`]: () => {
+      labels.push(LABEL);
+      return { status: 200, json: {} };
+    },
+    [`DELETE repos/${REPO}/issues/7/labels/${encodeURIComponent(LABEL)}`]: () => {
+      labels.splice(0);
+      return { status: 200, json: {} };
+    },
+  });
+  const decision = await reconcileReadyLabel({
+    api, graphql: async () => threadsData([]),
+    repo: REPO, prNumber: 7, appId: APP_ID, botLogin: BOT, isBot, label: LABEL,
+    log() {}, warn() {},
+  });
+  assert.equal(decision, 'stale-head');
+  assert.equal(api.calls.filter((c) => c.method === 'POST').length, 1);
+  assert.ok(api.calls.some((c) => c.method === 'DELETE'));
+  assert.deepEqual(labels, []);
+  assert.equal(shas.length, 0);
 });
 
 test('operational failures reject so Lambda retries; validation errors resolve', async () => {
