@@ -379,3 +379,83 @@ test('an automatic review that is closed at the done frame stays completed', asy
   assert.equal(frames.at(-1).data.skip_reason, 'the pull request is a draft and this route skips drafts');
   assert.deepEqual(written, ['running', 'completed']);
 });
+
+test('the ready-label invoker is passed to the tools only when the function is configured', async (t) => {
+  recordHeartbeats(t);
+  const labeledEnv = loadEnv({
+    BEDROCK_MODEL_ID: 'primary-model',
+    FALLBACK_MODEL_ID: 'openai.fallback-model',
+    AWS_REGION: 'us-west-2',
+    MANTLE_REGION: 'us-east-1',
+    SUMMARIZER_MODEL_ID: 'summary-model',
+    SUMMARIZER_FALLBACK_MODEL_ID: 'openai.summary-fallback',
+    ASSETS_BUCKET: 'assets',
+    PROMPT_S3_KEY: 'prompt.md',
+    SKILL_S3_KEY: 'skill.md',
+    GITHUB_APP_ID: '123456',
+    TOKEN_BROKER_FUNCTION: 'token-broker',
+    WORKSPACE_ROOT: '/workspace/valkey',
+    HEARTBEAT_TABLE: 'heartbeats',
+    READY_LABEL_FUNCTION: 'ready-label',
+  });
+  const factoryOpts = [];
+  let passed;
+  const handler = createReviewHandler({
+    env: labeledEnv,
+    systemPrompt: 'You review pull requests.',
+    assembleTools: async ({ ctx: prCtx, octokit, tokens, onTerminal, syncReadyLabel }) => {
+      passed = syncReadyLabel;
+      return [noop, buildSkipTool({
+        ctx: prCtx, octokit, tokens, syncReadyLabel,
+        stateWriter: { write: async () => ({ id: 1, url: 'https://github.com/state' }) },
+        terminalGate: createTerminalGate(onTerminal),
+      })];
+    },
+    deps: {
+      createModel: () => new ScriptedModel([skipTurn]),
+      createTokenSource: () => ({ get: async () => 'token' }),
+      createOctokit: () => ({}),
+      prepareWorkspace: async () => ctx,
+      loadGraduatedSkills: async () => [],
+      createStatusComment: () => { throw new Error('only mention runs have a status comment'); },
+      createReadyLabelInvoker: (opts) => {
+        factoryOpts.push(opts);
+        return async () => {};
+      },
+    },
+  });
+  await consume(handler(payload), (f) => f.event === 'status' && f.data.phase === 'review');
+  assert.deepEqual(factoryOpts, [{
+    functionName: 'ready-label',
+    region: 'us-west-2',
+    installationId: 1,
+    repo: 'valkey-io/valkey',
+    prNumber: 7,
+  }]);
+  assert.equal(typeof passed, 'function');
+
+  let absent;
+  const unconfigured = createReviewHandler({
+    env,
+    systemPrompt: 'You review pull requests.',
+    assembleTools: async ({ syncReadyLabel, onTerminal, ctx: prCtx, octokit, tokens }) => {
+      absent = syncReadyLabel;
+      return [noop, buildSkipTool({
+        ctx: prCtx, octokit, tokens,
+        stateWriter: { write: async () => ({ id: 1, url: 'https://github.com/state' }) },
+        terminalGate: createTerminalGate(onTerminal),
+      })];
+    },
+    deps: {
+      createModel: () => new ScriptedModel([skipTurn]),
+      createTokenSource: () => ({ get: async () => 'token' }),
+      createOctokit: () => ({}),
+      prepareWorkspace: async () => ctx,
+      loadGraduatedSkills: async () => [],
+      createStatusComment: () => { throw new Error('only mention runs have a status comment'); },
+      createReadyLabelInvoker: () => { throw new Error('no ready-label function is configured'); },
+    },
+  });
+  await consume(unconfigured(payload), (f) => f.event === 'status' && f.data.phase === 'review');
+  assert.equal(absent, undefined);
+});

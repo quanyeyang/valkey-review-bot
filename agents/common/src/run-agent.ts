@@ -93,6 +93,8 @@ export interface RunDeps {
   readonly prepareWorkspace: typeof prepareWorkspace;
   readonly loadGraduatedSkills: typeof loadGraduatedSkills;
   readonly createStatusComment: typeof createStatusComment;
+  /** Builds the fire-and-forget ready-label invoke. Tests replace it. */
+  readonly createReadyLabelInvoker: typeof createReadyLabelInvoker;
 }
 
 function createModel(env: AgentEnv, modelId: string): Model {
@@ -109,6 +111,7 @@ const DEFAULT_DEPS: RunDeps = {
   prepareWorkspace,
   loadGraduatedSkills,
   createStatusComment,
+  createReadyLabelInvoker,
 };
 
 export interface ReviewHandlerOpts {
@@ -297,7 +300,7 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
 
       yield { event: 'status', data: { phase: 'tools' } };
       const syncReadyLabel = env.readyLabelFunction
-        ? createReadyLabelInvoker({
+        ? deps.createReadyLabelInvoker({
             functionName: env.readyLabelFunction,
             region: env.region,
             installationId: payload.installation_id,
