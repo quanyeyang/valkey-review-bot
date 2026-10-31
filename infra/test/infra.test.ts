@@ -445,6 +445,12 @@ describe('ready label', () => {
       .filter(([id]) => id.startsWith('ReadyLabelFn'));
     expect(readyFns).toHaveLength(1);
     expect((readyFns[0]![1] as any).Properties.ReservedConcurrentExecutions).toBe(1);
+    substrate.hasResourceProperties('AWS::Lambda::EventInvokeConfig', {
+      DestinationConfig: { OnFailure: { Destination: Match.anyValue() } },
+    });
+    const dlqOutput = Object.entries(substrate.toJSON().Outputs ?? {}).find(([id]) => id.startsWith('ReadyLabelDeadLetterQueueName'));
+    expect(dlqOutput).toBeDefined();
+    expect(JSON.stringify(dlqOutput?.[1])).toContain('ApproximateNumberOfMessagesVisible');
     expect(statementsForRole(substrate, functionRoleId(substrate, 'ReadyLabelFn')).flatMap(actionsOf))
       .toContain('secretsmanager:GetSecretValue');
 

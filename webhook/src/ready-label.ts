@@ -2,34 +2,40 @@ import { botMatcher, isAppLogin, type GitHubUser } from './config.js';
 import { fetchRepoInstallation, type GitHubApi } from './github.js';
 
 /**
- * Projects this App's review readiness onto one PR label. The reviewer
- * runtime never sees `issues: write`: this module mints that token itself
- * and mutates GitHub. Callers send only `{ installation_id, repo, pr_number }`.
- * The label name comes from the environment, never from the event.
+ * Projects this App's review readiness onto one PR label. Callers send
+ * only `{ installation_id, repo, pr_number }`. The label name comes from
+ * the environment, never from the event. The token minted here is
+ * `pull_requests: write` and `metadata: read`. That adds or removes a
+ * label that already exists on the pull request. It cannot create one:
+ * GitHub answers 403, which is logged as `missing-label`.
  *
- * The label is added when the PR is open and not a draft, this App has a
- * completed review at the current head, every review thread this App
- * started is resolved or has a later human reply, and any PR-wide
- * concern (a finding with no location, or Direction) is ready or has a
- * later human issue comment. The agent's verdict may still be
- * needs_work: a human disagreement hands the PR to maintainers without
- * waiting for the agent to withdraw. Missing, failed, or stale reviews
- * never count. Anything else removes the label if it is present. The
- * label is never created.
+ * The label is added when the PR is open and not a draft and this App has
+ * a completed review at the current head. On ready, every thread this App
+ * started is resolved or has a later human reply that does not @mention
+ * the bot. On needs_work that is not enough: at least one such thread
+ * must have been addressed, or a blocking PR-wide finding or Direction
+ * must have a later human issue comment that does not @mention the bot.
+ * Minors do not count. An empty needs_work does not get the label.
+ * Missing, failed, or stale reviews never count. Anything else removes
+ * the label if it is present.
  *
  * Before a mutation the head is fetched again. After one, the head,
  * comments and threads are fetched again: a resolve that races an
  * unresolve (or a reply that races a deletion) must not leave the
  * label on. ReadyLabelFn runs with reserved concurrency 1 so async
  * invokes for every PR are serialized; a throttled Event is retried.
- * If attempts run out after an add, the label is removed before
- * returning stale-head.
+ * If attempts run out after an add, or a later read throws, the label
+ * is removed before the invocation ends. A new attempt does not start
+ * when the Lambda has under ten seconds left.
  */
 
 /** Identical to agents/common/src/review-state.ts. Tests parse that renderer. */
 export const STATE_MARKER = '<!-- valkey-reviewer:state -->';
 
-export const LABEL_PERMISSIONS = { issues: 'write', pull_requests: 'read', metadata: 'read' } as const;
+export const LABEL_PERMISSIONS = { pull_requests: 'write', metadata: 'read' } as const;
+
+/** Stop before a new attempt when the Lambda has less than this left. */
+export const MIN_REMAINING_MS = 10_000;
 
 /** Restarts when the head or the predicate moves under a reconcile. */
 export const MAX_RECONCILE_ATTEMPTS = 4;
@@ -55,7 +61,7 @@ export interface ReadyState {
 
 export interface ReviewThread {
   readonly isResolved: boolean;
-  readonly comments: readonly { readonly author?: GitHubUser }[];
+  readonly comments: readonly { readonly author?: GitHubUser; readonly body?: string }[];
 }
 
 export interface ReconcileDeps {
@@ -67,6 +73,8 @@ export interface ReconcileDeps {
   readonly botLogin: string;
   readonly isBot: (user: GitHubUser | undefined) => boolean;
   readonly label: string;
+  /** Milliseconds until the Lambda invocation is frozen. Absent in tests. */
+  readonly remainingMs?: () => number;
   readonly log?: (line: string) => void;
   readonly warn?: (line: string) => void;
 }
@@ -77,6 +85,7 @@ export interface ReadyLabelDeps {
   readonly appId: number;
   readonly botLogin: string;
   readonly knownBotLogins: ReadonlySet<string>;
+  readonly remainingMs?: () => number;
   readonly appApi: () => Promise<GitHubApi>;
   readonly issueToken: (request: LabelTokenRequest) => Promise<{ token: string; expiresAt: string }>;
   readonly githubApi: (token: string) => GitHubApi;
@@ -95,6 +104,7 @@ const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $cu
           comments(first: 100) {
             nodes {
               author { __typename login }
+              body
             }
           }
         }
@@ -146,9 +156,32 @@ export function openPrWideConcerns(body: string): boolean {
   const section = rest.split(/\n\*\*/)[0] ?? '';
   for (const line of section.split('\n')) {
     if (!line.startsWith('- ')) continue;
-    if (!/^- (?:\(minor\) )?`/.test(line)) return true;
+    if (line.startsWith('- (minor) ')) continue;
+    if (/^- `/.test(line)) continue;
+    return true;
   }
   return false;
+}
+
+/**
+ * Same boundary as mentionPattern in mention.ts. People type @slug, not
+ * @slug[bot]. A tag is a command to the bot, not an answer to a finding.
+ */
+export function mentionsBot(body: string | undefined, botLogin: string): boolean {
+  if (!body) return false;
+  const handle = botLogin.replace(/\[bot\]$/i, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^\\w@/-])@${handle}(?![\\w-])`, 'i').test(body);
+}
+
+/**
+ * GraphQL Actor.login for a Bot is the slug. REST user.login is
+ * slug[bot]. __typename Bot is what makes it a bot; the suffix is not
+ * in the GraphQL string. A User with the same slug is not this App.
+ */
+export function isAppGraphQLAuthor(author: GitHubUser | undefined, botLogin: string): boolean {
+  if (!author?.login || author.type !== 'Bot') return false;
+  const slug = (login: string) => login.toLowerCase().replace(/\[bot\]$/, '');
+  return slug(author.login) === slug(botLogin);
 }
 
 /**
@@ -159,12 +192,14 @@ export function humanAnsweredAfter(
   comments: readonly IssueComment[],
   stateComment: IssueComment,
   isBot: (user: GitHubUser | undefined) => boolean,
+  botLogin: string,
 ): boolean {
   const after = stateComment.updated_at ?? stateComment.created_at;
   if (typeof after !== 'string' || !after) return false;
   for (const comment of comments) {
     if (comment === stateComment) continue;
     if (!comment.user?.login || isBot(comment.user)) continue;
+    if (mentionsBot(comment.body ?? undefined, botLogin)) continue;
     const at = comment.created_at;
     if (typeof at === 'string' && at > after) return true;
   }
@@ -173,10 +208,11 @@ export function humanAnsweredAfter(
 
 /**
  * True when the PR should carry the configured ready label. A completed
- * review at this head is required; the agent's ready line is not.
- * Missing or stale state never qualifies. When the agent already said
- * ready, PR-wide minors do not block. When it said needs_work, every
- * PR-wide concern must have a later human issue comment.
+ * review at this head is required. On ready, addressed threads are
+ * enough and a blocking PR-wide finding still blocks. On needs_work,
+ * an empty comment does not qualify: this App must have started a
+ * thread that was addressed, or a blocking PR-wide finding or Direction
+ * must have a later human issue comment.
  */
 export function wantReadyLabel(args: {
   readonly prState: string;
@@ -184,19 +220,24 @@ export function wantReadyLabel(args: {
   readonly headSha: string;
   readonly state: ReadyState | undefined;
   readonly threadsOk: boolean;
-  readonly prWideOk: boolean;
+  readonly hasAppThread: boolean;
+  readonly blockingPrWide: boolean;
+  readonly prWideAnswered: boolean;
 }): boolean {
   if (args.prState !== 'open' || args.draft) return false;
   if (!args.state) return false;
   if (args.state.headPrefix !== args.headSha.slice(0, 10).toLowerCase()) return false;
   if (!args.threadsOk) return false;
-  return args.state.ready || args.prWideOk;
+  if (args.state.ready) return !args.blockingPrWide;
+  if (args.blockingPrWide) return args.prWideAnswered;
+  return args.hasAppThread;
 }
 
 /**
  * Every thread this App started is either resolved or has a later comment
- * whose author is not a bot. Threads someone else started are ignored.
- * Resolve without a reply counts; a human reply without resolve counts.
+ * whose author is not a bot and which does not @mention the bot. Threads
+ * someone else started are ignored. The first comment's author is the
+ * GraphQL shape: bare login, type Bot.
  */
 export function threadsAddressed(
   threads: readonly ReviewThread[],
@@ -204,13 +245,17 @@ export function threadsAddressed(
   isBot: (user: GitHubUser | undefined) => boolean,
 ): boolean {
   for (const thread of threads) {
-    const first = thread.comments[0]?.author;
-    if (!isAppLogin(first?.login, botLogin)) continue;
+    if (!isAppGraphQLAuthor(thread.comments[0]?.author, botLogin)) continue;
     if (thread.isResolved) continue;
-    const humanReply = thread.comments.slice(1).some((c) => c.author !== undefined && !isBot(c.author));
+    const humanReply = thread.comments.slice(1).some((c) =>
+      c.author !== undefined && !isBot(c.author) && !mentionsBot(c.body, botLogin));
     if (!humanReply) return false;
   }
   return true;
+}
+
+export function hasAppThread(threads: readonly ReviewThread[], botLogin: string): boolean {
+  return threads.some((thread) => isAppGraphQLAuthor(thread.comments[0]?.author, botLogin));
 }
 
 function sameHead(a: PullSnapshot, b: PullSnapshot): boolean {
@@ -230,15 +275,16 @@ async function readWant(
   const body = stateComment?.body ?? '';
   const state = stateComment ? parseReadyState(body) : undefined;
   const threads = await listReviewThreads(deps.graphql, deps.repo, deps.prNumber);
+  const blockingPrWide = !!stateComment && openPrWideConcerns(body);
   return wantReadyLabel({
     prState: pull.state,
     draft: pull.draft,
     headSha: pull.headSha,
     state,
     threadsOk: threadsAddressed(threads, deps.botLogin, deps.isBot),
-    prWideOk: !stateComment
-      || !openPrWideConcerns(body)
-      || humanAnsweredAfter(comments, stateComment, deps.isBot),
+    hasAppThread: hasAppThread(threads, deps.botLogin),
+    blockingPrWide,
+    prWideAnswered: !!stateComment && humanAnsweredAfter(comments, stateComment, deps.isBot, deps.botLogin),
   });
 }
 
@@ -246,50 +292,66 @@ export async function reconcileReadyLabel(deps: ReconcileDeps): Promise<string> 
   const log = deps.log ?? ((line: string) => console.log(line));
   const warn = deps.warn ?? ((line: string) => console.warn(line));
   const { repo, prNumber, label } = deps;
+  const remainingMs = deps.remainingMs ?? (() => Number.POSITIVE_INFINITY);
   let leftoverAdd = false;
 
-  for (let attempt = 1; attempt <= MAX_RECONCILE_ATTEMPTS; attempt++) {
-    const pull = await fetchPull(deps.api, repo, prNumber);
-    const want = await readWant(deps, pull);
+  try {
+    for (let attempt = 1; attempt <= MAX_RECONCILE_ATTEMPTS; attempt++) {
+      if (remainingMs() < MIN_REMAINING_MS) {
+        log(`[ready-label] repo=${repo} pr=${prNumber} stopping with ${remainingMs()}ms left`);
+        break;
+      }
+      const pull = await fetchPull(deps.api, repo, prNumber);
+      const want = await readWant(deps, pull);
 
-    const latest = await fetchPull(deps.api, repo, prNumber);
-    if (!sameHead(pull, latest)) {
-      log(`[ready-label] repo=${repo} pr=${prNumber} stale-head attempt=${attempt}`);
-      continue;
-    }
-
-    const has = hasLabel(latest, label);
-    let decision: string;
-    let mutated = false;
-    if (want && has) {
-      decision = 'already-on';
-    } else if (want && !has) {
-      decision = await addLabel(deps.api, repo, prNumber, label);
-      mutated = decision === 'added' || decision === 'missing-label';
-      leftoverAdd = decision === 'added';
-    } else if (!want && has) {
-      await removeLabel(deps.api, repo, prNumber, label);
-      leftoverAdd = false;
-      decision = 'removed';
-      mutated = true;
-    } else {
-      decision = 'already-off';
-    }
-
-    if (mutated) {
-      const after = await fetchPull(deps.api, repo, prNumber);
-      if (!sameHead(pull, after) || await readWant(deps, after) !== want) {
-        log(`[ready-label] repo=${repo} pr=${prNumber} stale after ${decision} attempt=${attempt}`);
+      const latest = await fetchPull(deps.api, repo, prNumber);
+      if (!sameHead(pull, latest)) {
+        log(`[ready-label] repo=${repo} pr=${prNumber} stale-head attempt=${attempt}`);
         continue;
       }
-    }
 
-    if (decision === 'missing-label') {
-      warn(`[ready-label] repo=${repo} pr=${prNumber} missing-label=${JSON.stringify(label)}`);
-    } else {
-      log(`[ready-label] repo=${repo} pr=${prNumber} want=${want} decision=${decision}`);
+      const has = hasLabel(latest, label);
+      let decision: string;
+      let mutated = false;
+      if (want && has) {
+        decision = 'already-on';
+      } else if (want && !has) {
+        decision = await addLabel(deps.api, repo, prNumber, label);
+        mutated = decision === 'added' || decision === 'missing-label';
+        leftoverAdd = decision === 'added';
+      } else if (!want && has) {
+        await removeLabel(deps.api, repo, prNumber, label);
+        leftoverAdd = false;
+        decision = 'removed';
+        mutated = true;
+      } else {
+        decision = 'already-off';
+      }
+
+      if (mutated) {
+        const after = await fetchPull(deps.api, repo, prNumber);
+        if (!sameHead(pull, after) || await readWant(deps, after) !== want) {
+          log(`[ready-label] repo=${repo} pr=${prNumber} stale after ${decision} attempt=${attempt}`);
+          continue;
+        }
+      }
+
+      if (decision === 'missing-label') {
+        warn(`[ready-label] repo=${repo} pr=${prNumber} missing-label=${JSON.stringify(label)}`);
+      } else {
+        log(`[ready-label] repo=${repo} pr=${prNumber} want=${want} decision=${decision}`);
+      }
+      return decision;
     }
-    return decision;
+  } catch (err) {
+    if (leftoverAdd) {
+      try {
+        await removeLabel(deps.api, repo, prNumber, label);
+      } catch (undo) {
+        warn(`[ready-label] repo=${repo} pr=${prNumber} undo failed: ${undo instanceof Error ? undo.message : String(undo)}`);
+      }
+    }
+    throw err;
   }
 
   if (leftoverAdd) await removeLabel(deps.api, repo, prNumber, label);
@@ -362,6 +424,7 @@ export function createReadyLabelApplier(deps: ReadyLabelDeps): (event: ReadyLabe
       botLogin: deps.botLogin,
       isBot,
       label,
+      remainingMs: deps.remainingMs,
       log,
       warn,
     });
@@ -472,11 +535,14 @@ function parseThread(node: unknown): ReviewThread | undefined {
   return { isResolved: t.isResolved === true, comments };
 }
 
-function parseThreadComment(node: unknown): { author?: GitHubUser } {
+function parseThreadComment(node: unknown): { author?: GitHubUser; body?: string } {
   if (typeof node !== 'object' || node === null) return {};
-  const author = (node as { author?: { __typename?: unknown; login?: unknown } | null }).author;
-  if (!author || typeof author.login !== 'string') return {};
+  const raw = node as { author?: { __typename?: unknown; login?: unknown } | null; body?: unknown };
+  const body = typeof raw.body === 'string' ? raw.body : undefined;
+  const author = raw.author;
+  if (!author || typeof author.login !== 'string') return { body };
   return {
+    body,
     author: {
       login: author.login,
       type: author.__typename === 'Bot' ? 'Bot' : 'User',
@@ -485,10 +551,18 @@ function parseThreadComment(node: unknown): { author?: GitHubUser } {
 }
 
 async function addLabel(api: GitHubApi, repo: string, prNumber: number, label: string): Promise<string> {
-  const { status } = await api('POST', `repos/${repo}/issues/${prNumber}/labels`, { labels: [label] });
-  if (status === 404 || status === 422) return 'missing-label';
+  const { status, json } = await api('POST', `repos/${repo}/issues/${prNumber}/labels`, { labels: [label] });
+  if (status === 404 || status === 422 || refusesToCreateLabel(status, json)) return 'missing-label';
   if (status !== 200) throw new Error(`POST repos/${repo}/issues/${prNumber}/labels returned ${status}`);
   return 'added';
+}
+
+function refusesToCreateLabel(status: number, json: unknown): boolean {
+  if (status !== 403) return false;
+  const message = typeof json === 'object' && json !== null && typeof (json as { message?: unknown }).message === 'string'
+    ? (json as { message: string }).message
+    : '';
+  return /create labels/i.test(message);
 }
 
 async function removeLabel(api: GitHubApi, repo: string, prNumber: number, label: string): Promise<void> {

@@ -63,7 +63,7 @@ export function createOctokit(tokens: TokenSource): Octokit {
 /**
  * Fire-and-forget invoke of the ready-label Lambda. Never throws: a
  * failed invoke is logged and the review continues. The function mints
- * its own issues:write token; this payload is only the PR identity.
+ * its own pull_requests:write token; this payload is only the PR identity.
  */
 export function createReadyLabelInvoker(opts: {
   functionName: string;

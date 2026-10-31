@@ -258,7 +258,10 @@ test('a failed ready-label invoke does not fail the review', async () => {
     syncReadyLabel: async () => { throw new Error('lambda down'); },
   });
   const raw = await h.skip.invoke({ reason: 'Nothing new.', state: state() });
-  assert.equal(JSON.parse(raw).ok, true);
+  const parsed = JSON.parse(raw);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.state_comment_url, 'https://github.com/state');
+  assert.equal('state_comment_error' in parsed, false);
   assert.equal(h.terminal.length, 1);
 });
 

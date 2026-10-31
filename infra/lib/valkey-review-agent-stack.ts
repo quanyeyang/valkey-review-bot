@@ -104,8 +104,7 @@ export class ValkeyReviewAgentStack extends cdk.Stack {
     // secrets and has no Secrets Manager, concerns-table or registry-write
     // access. Its only writes are its own logs, the heartbeat table and,
     // through the token broker, the pull request. The ready-label Lambda,
-    // when granted, mints issues:write itself; this role never holds that
-    // permission.
+    // when granted, mints its own token and never returns it.
     const runtimeName = props.agentId.replace(/-/g, '_') + '_runtime';
     this.role = createRuntimeRole(this, 'RuntimeRole', {
       description: `Execution role for the ${props.agentId} runtime.`,

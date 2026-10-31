@@ -12,9 +12,9 @@ import {
  * Reviewer runtimes and the webhook receiver invoke this function
  * (IAM lambda:InvokeFunction) after a state write or a PR / thread event
  * that can change readiness. It mints an installation token with
- * issues:write itself, reconciles one configured label on that pull
- * request, and never returns a token. The label name and the repository
- * allowlist come from the environment. The caller sends only
+ * pull_requests:write itself, reconciles one configured label on that
+ * pull request, and never returns a token. The label name and the
+ * repository allowlist come from the environment. The caller sends only
  * `{ installation_id, repo, pr_number }`.
  *
  * The function is created only when at least one route sets readyLabel.
@@ -92,18 +92,29 @@ async function privateKey(): Promise<string> {
 
 const appAuth = async () => createAppAuth({ appId: APP_ID, privateKey: await privateKey() });
 
+const clock: { remainingMs?: () => number } = {};
+
 const apply = createReadyLabelApplier({
   allowedRepos: ALLOWED_REPOS,
   labelsByRepo: LABELS_BY_REPO,
   appId: Number(APP_ID),
   botLogin: BOT_LOGIN,
   knownBotLogins: KNOWN_BOT_LOGINS,
+  remainingMs: () => clock.remainingMs?.() ?? Number.POSITIVE_INFINITY,
   appApi: async () => githubApi((await (await appAuth())({ type: 'app' })).token),
   issueToken: async (request) => (await appAuth())({ type: 'installation', ...request }),
   githubApi,
   graphql: githubGraphql,
 });
 
-export async function handler(event: ReadyLabelEvent): Promise<ReadyLabelResult> {
-  return runReadyLabelHandler(apply, event);
+export async function handler(
+  event: ReadyLabelEvent,
+  context?: { getRemainingTimeInMillis?: () => number },
+): Promise<ReadyLabelResult> {
+  clock.remainingMs = context?.getRemainingTimeInMillis?.bind(context);
+  try {
+    return await runReadyLabelHandler(apply, event);
+  } finally {
+    clock.remainingMs = undefined;
+  }
 }

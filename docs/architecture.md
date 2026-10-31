@@ -27,7 +27,7 @@ GitHub App webhook
 HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> GitHub (review, state comment)
                       |   (one per route)    ^               |    |
                       |                      |               |    +-> token broker (repo-scoped token)
-                      |                      |               |    +-> ready-label Lambda (issues:write, never returned)
+                      |                      |               |    +-> ready-label Lambda (pull_requests:write, never returned)
                       |                      +-- heartbeat --+
                       |                          table
                       |
@@ -64,15 +64,21 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
 5. The model ends with `post_review` (a `COMMENT` review with inline
    comments) or `skip_review`. Both rewrite the pull request's review state
    comment. After a successful write, the runtime invokes the ready-label
-   Lambda when `READY_LABEL_FUNCTION` is set. New commits, draft/close/
-   reopen, thread resolve/unresolve, a human reply on a review comment
-   (created or deleted), and an issue comment on the pull request also
-   invoke it from the receiver, including when review routing returned
-   500. The function adds the configured label when the PR is open and
-   not a draft, this App has a completed review at the current head,
-   every thread this App started is resolved or has a later human reply,
-   and any PR-wide concern has been answered; the agent may still say
-   needs_work. Otherwise it removes that label.
+   Lambda when `READY_LABEL_FUNCTION` is set. New commits, close and
+   draft invoke it from the receiver before routing, so a routing timeout
+   still drops a stale label. Reopen, ready-for-review, thread
+   resolve/unresolve, and a review or issue comment on the pull request
+   (created, deleted or edited) invoke it after routing, including when
+   routing returned 500. GraphQL reports a bot's login without `[bot]`;
+   the reconciler matches the slug and requires the author to be a Bot.
+   The label is added only for an open non-draft PR with a completed
+   review at the current head. On ready, every thread this App started
+   is resolved or has a later human reply that does not @mention the bot.
+   On needs_work, an empty comment does not qualify: a thread this App
+   started must have been addressed that way, or a blocking PR-wide
+   finding or Direction must have a later human issue comment that does
+   not @mention the bot. Minors do not count. Otherwise the label is
+   removed.
 6. The runtime marks the heartbeat `completed` and sends a `done` event, and
    SQS deletes the message. If the worker's 15 minute limit ends its read
    first, later receives of the message decide from the heartbeat whether to
@@ -738,10 +744,14 @@ When a route sets `readyLabel`, substrate creates one Lambda
 receiver may invoke. It never returns a token. The payload is
 `{ installation_id, repo, pr_number }`; the label name comes from
 `READY_LABEL_BY_REPO_JSON`. It uses the same installation and owner checks
-as the token broker, then mints `issues: write`, `pull_requests: read` and
+as the token broker, then mints `pull_requests: write` and
 `metadata: read` (`LABEL_PERMISSIONS` in `webhook/src/ready-label.ts`) and
-adds or removes that one label. A missing repository label is logged
-(`missing-label`) and not created. Failed GitHub or Secrets Manager
+adds or removes that one label. GraphQL bot logins have no `[bot]`
+suffix; a thread counts only when the author is a Bot and the slug
+matches. A reply that @mentions the bot is not an answer. On
+`needs_work`, an empty state does not qualify, and a PR-wide minor does
+not count. A missing repository label is a 403 and is logged
+(`missing-label`), not created. Failed GitHub or Secrets Manager
 calls reject the Lambda invoke so the async Event retry can run them
 again; they never fail the webhook or the review. An older reconcile
 that raced a push re-reads the head before a mutation, and the head,
@@ -750,9 +760,15 @@ comments and threads after one, so a resolve that races an unresolve
 ReadyLabelFn is reserved to one concurrent execution, which serializes
 async Event invokes; a throttled invoke is retried. If attempts run out
 after an add, the label is removed before returning `stale-head`.
+The same removal runs when a later read throws, and a new attempt does
+not start when the invocation has under ten seconds left. Async invokes
+that exhaust Lambda's retries go to the function's dead-letter queue.
 
-The reviewer token stays `pull_requests: write` + `metadata: read`. Pull
-request code that steals it cannot label arbitrary issues.
+The reviewer token stays `pull_requests: write` + `metadata: read`, so
+code from the pull request can already add an existing label on that
+repository. This function decides the automatic projection. It does not
+create labels: the same permission gets a 403 when the name is missing
+from the repository.
 
 ### Skills-repo token broker
 

@@ -1057,6 +1057,50 @@ test('a failed enqueue on synchronize still reconciles the ready label', async (
   assert.deepEqual(readyLabel, [{ installationId: 42, repo: REPO, prNumber: 7 }]);
 });
 
+test('synchronize reconciles the ready label before the enqueue', async () => {
+  const order = [];
+  const { handler } = setup({
+    env: READY_ENV,
+    sendMessage: async () => { order.push('enqueue'); throw new Error('queue unavailable'); },
+    syncReadyLabel: async () => { order.push('sync'); },
+  });
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const resp = await handler(delivery('pull_request', push('bbb')));
+    assert.equal(resp.statusCode, 500);
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(order, ['sync', 'enqueue']);
+});
+
+test('editing a comment on a pull request reconciles the ready label', async () => {
+  const { handler, readyLabel } = setup({ env: READY_ENV });
+  await handler(delivery('issue_comment', {
+    action: 'edited', installation: { id: 42 }, repository: { full_name: REPO },
+    issue: { number: 7, pull_request: {}, user: { login: 'author' } },
+    comment: {
+      id: 9,
+      body: '<!-- valkey-reviewer:state -->\n**Ready for human review.**',
+      user: { login: BOT, type: 'Bot' },
+      author_association: 'NONE',
+    },
+  }));
+  assert.deepEqual(readyLabel, [{ installationId: 42, repo: REPO, prNumber: 7 }]);
+  await handler(delivery('issue_comment', {
+    action: 'edited', installation: { id: 42 }, repository: { full_name: REPO },
+    issue: { number: 7, pull_request: {}, user: { login: 'author' } },
+    comment: {
+      id: 10,
+      body: 'I disagree with the DCO finding. The commits are signed.',
+      user: { login: 'maintainer' },
+      author_association: 'MEMBER',
+    },
+  }));
+  assert.equal(readyLabel.length, 2);
+});
+
 test('a summons on an unrouted repository is skipped', async () => {
   const { handler } = setup();
   const resp = await handler(delivery('issue_comment', {

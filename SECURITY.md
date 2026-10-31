@@ -27,14 +27,16 @@ away from it:
   for repositories that are not routed to that reviewer. No reviewer token
   carries `contents` permission, and the reviewer App needs none.
 - When a route sets `readyLabel`, a separate ready-label Lambda mints its own
-  short-lived token with `issues: write`, `pull_requests: read` and
-  `metadata: read`, reconciles one configured label on that pull request, and
-  never returns a token. Reviewer runtimes and the receiver invoke it with
+  short-lived token with `pull_requests: write` and `metadata: read`, reconciles
+  one configured label on that pull request, and never returns a token.
+  Reviewer runtimes and the receiver invoke it with
   `{ installation_id, repo, pr_number }` only. The label name and repository
-  allowlist come from the environment. The reviewer role still has no
-  `issues: write`: pull request code that steals the run's token cannot label
-  arbitrary issues. It can invoke the ready-label function, which only adds or
-  removes that one label after reading GitHub.
+  allowlist come from the environment. `pull_requests: write` can add a label
+  that already exists; GitHub answers 403 when the label is not in the
+  repository, and the function logs that instead of creating it. The reviewer
+  token already has `pull_requests: write` for the repository under review, so
+  this function guards the automatic decision. It does not take away that
+  token's ability to set an existing label.
 - When the deployment proposes edits to the reviewers' built-in skill files,
   a separate skills-repo token broker gives the curator, and only the curator,
   a short-lived token for the bot's own repository, with `contents: write`,

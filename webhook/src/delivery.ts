@@ -98,8 +98,12 @@ const THREAD_EVENT = 'pull_request_review_thread';
 const READY_LABEL_PULL_ACTIONS: ReadonlySet<string> = new Set([
   'synchronize', 'closed', 'converted_to_draft', 'ready_for_review', 'reopened',
 ]);
+/** These can only remove the label. Invoke them before routing so a routing timeout cannot skip that. */
+const READY_LABEL_REMOVAL_ACTIONS: ReadonlySet<string> = new Set([
+  'synchronize', 'closed', 'converted_to_draft',
+]);
 const READY_LABEL_THREAD_ACTIONS: ReadonlySet<string> = new Set(['resolved', 'unresolved']);
-const READY_LABEL_COMMENT_ACTIONS: ReadonlySet<string> = new Set(['created', 'deleted']);
+const READY_LABEL_COMMENT_ACTIONS: ReadonlySet<string> = new Set(['created', 'deleted', 'edited']);
 /** The pull_request actions that start an automatic review, and the trigger each sends. */
 const REVIEW_TRIGGERS: ReadonlyMap<string, AutomaticTrigger> = new Map([
   ['opened', 'opened'],
@@ -516,10 +520,10 @@ export function createDeliveryHandler(
   }
 
   /**
-   * After review/mention routing. Never raises into the delivery: a
-   * failed invoke is logged and the delivery's status stands. Runs even
-   * when routing returned 500, so a queue failure on push still drops
-   * a stale ready label.
+   * Never raises into the delivery: a failed invoke is logged and the
+   * delivery's status stands. Removal actions run before routing, so a
+   * routing timeout still drops a stale label. Everything else runs
+   * after routing, including when routing returned 500.
    */
   async function maybeSyncReadyLabel(eventType: string, payload: WebhookPayload, target: Target): Promise<void> {
     if (!deps.syncReadyLabel) return;
@@ -551,6 +555,8 @@ export function createDeliveryHandler(
     const installationId = payload.installation?.id ?? config.installationId;
     if (typeof installationId !== 'number') return fail(400, 'missing-installation');
     const target = { repo, installationId };
+    const removalFirst = eventType === 'pull_request' && READY_LABEL_REMOVAL_ACTIONS.has(payload.action ?? '');
+    if (removalFirst) await maybeSyncReadyLabel(eventType, payload, target);
 
     let outcome: Outcome;
     try {
@@ -585,7 +591,7 @@ export function createDeliveryHandler(
       console.error('[receiver] delivery failed', err);
       outcome = fail(500, 'internal');
     }
-    await maybeSyncReadyLabel(eventType, payload, target);
+    if (!removalFirst) await maybeSyncReadyLabel(eventType, payload, target);
     return outcome;
   }
 

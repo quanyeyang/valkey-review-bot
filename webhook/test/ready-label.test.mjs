@@ -53,9 +53,11 @@ function needsWorkPrWide({ sha = HEAD, direction = false } = {}) {
   return `${STATE_MARKER}\n### Review state\n\n**Not ready for human review yet.**\nOne blocking finding is open.\n\n**Risk:** High. x\n\n${findings}\n<sub>Updated for ${sha.slice(0, 10)} at 2026-10-01 12:34 UTC. The bot rewrites this comment on every review.</sub>`;
 }
 
-function humanIssueComment({ created_at = '2026-10-01T13:00:00Z', login = 'maintainer' } = {}) {
+function humanIssueComment({
+  created_at = '2026-10-01T13:00:00Z', login = 'maintainer', body = 'Disagree: the DCO is on the commits.',
+} = {}) {
   return {
-    body: 'Disagree: the DCO is on the commits.',
+    body,
     user: { login, type: 'User' },
     created_at,
     updated_at: created_at,
@@ -76,16 +78,20 @@ function threadsData(nodes) {
   };
 }
 
-function thread({ resolved = false, authors = [BOT] } = {}) {
+function thread({ resolved = false, authors = ['example-reviewer'], bodies = [] } = {}) {
   return {
     isResolved: resolved,
     comments: {
-      nodes: authors.map((login) => ({
-        author: {
-          __typename: login.endsWith('[bot]') || login === 'coderabbitai' ? 'Bot' : 'User',
-          login,
-        },
-      })),
+      nodes: authors.map((login, i) => {
+        const bot = login.endsWith('[bot]') || login === 'coderabbitai' || login === 'example-reviewer' || login === 'other-reviewer';
+        return {
+          body: bodies[i],
+          author: {
+            __typename: bot ? 'Bot' : 'User',
+            login: login.replace(/\[bot\]$/i, ''),
+          },
+        };
+      }),
     },
   };
 }
@@ -96,6 +102,7 @@ function githubRoutes({
   pull = pullJson(),
   comments = [appComment()],
   addStatus = 200,
+  addJson = {},
   deleteStatus = 200,
   installation = installed(),
 } = {}) {
@@ -103,7 +110,7 @@ function githubRoutes({
     [`GET repos/${REPO}/installation`]: installation,
     [`GET repos/${REPO}/pulls/7`]: pull,
     [`GET repos/${REPO}/issues/7/comments?per_page=100&page=1`]: { status: 200, json: comments },
-    [`POST repos/${REPO}/issues/7/labels`]: { status: addStatus, json: {} },
+    [`POST repos/${REPO}/issues/7/labels`]: { status: addStatus, json: addJson },
     [`DELETE repos/${REPO}/issues/7/labels/${encodeURIComponent(LABEL)}`]: { status: deleteStatus, json: {} },
   };
 }
@@ -175,20 +182,23 @@ test('parseReadyState reads the renderer\'s ready line and 10-hex head prefix', 
   assert.equal(parseReadyState(`${STATE_MARKER}\n**Ready for human review.**`), undefined);
 });
 
-test('wantReadyLabel requires an open non-draft PR, a completed review at this head, and addressed findings', () => {
+test('wantReadyLabel requires an open non-draft PR and a completed review at this head', () => {
   const ok = {
     prState: 'open', draft: false, headSha: HEAD,
-    state: { ready: true, headPrefix: PREFIX }, threadsOk: true, prWideOk: true,
+    state: { ready: true, headPrefix: PREFIX },
+    threadsOk: true, hasAppThread: false, blockingPrWide: false, prWideAnswered: false,
   };
   assert.equal(wantReadyLabel(ok), true);
   assert.equal(wantReadyLabel({ ...ok, prState: 'closed' }), false);
   assert.equal(wantReadyLabel({ ...ok, draft: true }), false);
-  assert.equal(wantReadyLabel({ ...ok, state: { ready: false, headPrefix: PREFIX } }), true);
-  assert.equal(wantReadyLabel({ ...ok, state: { ready: false, headPrefix: PREFIX }, prWideOk: false }), false);
-  assert.equal(wantReadyLabel({ ...ok, prWideOk: false }), true, 'ready does not wait on PR-wide minors');
+  assert.equal(wantReadyLabel({ ...ok, state: { ready: false, headPrefix: PREFIX }, hasAppThread: true }), true);
+  assert.equal(wantReadyLabel({ ...ok, state: { ready: false, headPrefix: PREFIX } }), false, 'empty needs_work is not a handoff');
+  assert.equal(wantReadyLabel({ ...ok, state: { ready: false, headPrefix: PREFIX }, blockingPrWide: true, prWideAnswered: true }), true);
+  assert.equal(wantReadyLabel({ ...ok, state: { ready: false, headPrefix: PREFIX }, blockingPrWide: true }), false);
+  assert.equal(wantReadyLabel({ ...ok, blockingPrWide: true }), false, 'ready with a blocking PR-wide finding stays off');
   assert.equal(wantReadyLabel({ ...ok, state: { ready: true, headPrefix: 'aaaaaaaaaa' } }), false);
   assert.equal(wantReadyLabel({ ...ok, state: undefined }), false);
-  assert.equal(wantReadyLabel({ ...ok, threadsOk: false }), false);
+  assert.equal(wantReadyLabel({ ...ok, threadsOk: false, hasAppThread: true }), false);
 });
 
 test('openPrWideConcerns follows the renderer\'s PR-wide lines and Direction', () => {
@@ -199,20 +209,23 @@ test('openPrWideConcerns follows the renderer\'s PR-wide lines and Direction', (
   assert.equal(openPrWideConcerns(needsWorkPrWide()), true);
   assert.equal(openPrWideConcerns(needsWorkPrWide({ direction: true })), true);
   assert.equal(openPrWideConcerns(`${STATE_MARKER}\n**Open findings (1)**\n- \`src/server.c:10\` Leak.\n`), false);
+  assert.equal(openPrWideConcerns(`${STATE_MARKER}\n**Open findings (1)**\n- (minor) Commit title is long.\n`), false);
 });
 
 test('humanAnsweredAfter counts a non-bot issue comment created after the state rewrite', () => {
   const state = appComment();
-  assert.equal(humanAnsweredAfter([state], state, isBot), false);
-  assert.equal(humanAnsweredAfter([state, humanIssueComment()], state, isBot), true);
-  assert.equal(humanAnsweredAfter([state, humanIssueComment({ created_at: '2026-10-01T12:00:00Z' })], state, isBot), false);
-  assert.equal(humanAnsweredAfter([state, humanIssueComment({ login: BOT })], state, isBot), false);
+  assert.equal(humanAnsweredAfter([state], state, isBot, BOT), false);
+  assert.equal(humanAnsweredAfter([state, humanIssueComment()], state, isBot, BOT), true);
+  assert.equal(humanAnsweredAfter([state, humanIssueComment({ created_at: '2026-10-01T12:00:00Z' })], state, isBot, BOT), false);
+  assert.equal(humanAnsweredAfter([state, humanIssueComment({ login: BOT })], state, isBot, BOT), false);
+  assert.equal(humanAnsweredAfter([state, humanIssueComment({ body: '@example-reviewer please review the new test' })], state, isBot, BOT), false);
 });
 
 test('threadsAddressed: resolve or a later human reply; bot-only does not; other bots\' threads are ignored', () => {
   const ours = (comments, resolved = false) => ({ isResolved: resolved, comments });
-  const bot = { author: { login: BOT, type: 'Bot' } };
+  const bot = { author: { login: 'example-reviewer', type: 'Bot' } };
   const human = { author: { login: 'maintainer', type: 'User' } };
+  const command = { author: { login: 'maintainer', type: 'User' }, body: '@example-reviewer please recheck' };
   const rabbit = { author: { login: 'coderabbitai', type: 'User' } };
   const otherBot = { author: { login: 'other-reviewer[bot]', type: 'Bot' } };
 
@@ -220,6 +233,8 @@ test('threadsAddressed: resolve or a later human reply; bot-only does not; other
   assert.equal(threadsAddressed([ours([bot], true)], BOT, isBot), true);
   assert.equal(threadsAddressed([ours([bot, human])], BOT, isBot), true);
   assert.equal(threadsAddressed([ours([bot])], BOT, isBot), false);
+  assert.equal(threadsAddressed([ours([{ author: { login: 'example-reviewer', type: 'User' } }])], BOT, isBot), true, 'a User with the slug is not this App');
+  assert.equal(threadsAddressed([ours([bot, command])], BOT, isBot), false, 'an @mention is not an answer');
   assert.equal(threadsAddressed([ours([bot, rabbit])], BOT, isBot), false);
   assert.equal(threadsAddressed([ours([bot, otherBot])], BOT, isBot), false);
   assert.equal(threadsAddressed([ours([otherBot])], BOT, isBot), true, 'a thread we did not start is ignored');
@@ -238,6 +253,8 @@ test('an open ready PR at this head with no unaddressed threads gets the label',
     permissions: LABEL_PERMISSIONS,
   }]);
   assert.equal('contents' in LABEL_PERMISSIONS, false);
+  assert.equal('issues' in LABEL_PERMISSIONS, false);
+  assert.equal(LABEL_PERMISSIONS.pull_requests, 'write');
   const post = api.calls.find((c) => c.method === 'POST');
   assert.deepEqual(post.body, { labels: [LABEL] });
 });
@@ -550,6 +567,118 @@ test('an add on the last attempt is removed before returning stale-head', async 
   assert.ok(api.calls.some((c) => c.method === 'DELETE'));
   assert.deepEqual(labels, []);
   assert.equal(shas.length, 0);
+});
+
+test('a bare GraphQL bot login is this App and an open thread blocks the label', async () => {
+  const { decision, api } = await reconcile({
+    graphql: threadsData([thread({ authors: ['example-reviewer'] })]),
+  });
+  assert.equal(decision, 'already-off');
+  assert.ok(!api.calls.some((c) => c.method === 'POST'));
+});
+
+test('needs_work with nothing open does not get the label', async () => {
+  const { decision, api } = await reconcile({ comments: [appComment({ ready: false })] });
+  assert.equal(decision, 'already-off');
+  assert.ok(!api.calls.some((c) => c.method === 'POST'));
+});
+
+test('a PR-wide minor does not block a needs_work handoff and does not qualify alone', async () => {
+  const minor = needsWorkPrWide().replace('- DCO is missing.', '- (minor) Commit title is long.');
+  const alone = await reconcile({ comments: [appComment({ ready: false, body: minor })] });
+  assert.equal(alone.decision, 'already-off');
+  const handed = await reconcile({
+    comments: [appComment({ ready: false, body: minor })],
+    graphql: threadsData([thread({ authors: ['example-reviewer', 'maintainer'] })]),
+  });
+  assert.equal(handed.decision, 'added');
+});
+
+test('an @mention does not answer a needs_work thread or a PR-wide finding', async () => {
+  const threadOnly = await reconcile({
+    comments: [appComment({ ready: false })],
+    graphql: threadsData([thread({
+      authors: ['example-reviewer', 'maintainer'],
+      bodies: ['Leak on error.', '@example-reviewer please review the new test'],
+    })]),
+  });
+  assert.equal(threadOnly.decision, 'already-off');
+  const prWide = await reconcile({
+    comments: [
+      appComment({ ready: false, body: needsWorkPrWide() }),
+      humanIssueComment({ body: '@example-reviewer please review the new test' }),
+    ],
+  });
+  assert.equal(prWide.decision, 'already-off');
+});
+
+test('a 403 that refuses to create the label is missing-label; another 403 rejects', async () => {
+  const missing = await reconcile({
+    addStatus: 403,
+    addJson: { message: 'You do not have permission to create labels on this repository' },
+  });
+  assert.equal(missing.decision, 'missing-label');
+  await assert.rejects(() => reconcile({
+    addStatus: 403,
+    addJson: { message: 'You have exceeded a secondary rate limit.' },
+  }), /returned 403/);
+});
+
+test('a read that throws after an add removes the label and rejects', async () => {
+  const labels = [];
+  let pulls = 0;
+  const api = fakeGitHub({
+    [`GET repos/${REPO}/pulls/7`]: () => {
+      pulls += 1;
+      if (pulls >= 3) throw new Error('HTTP 502');
+      return pullJson({ labels: [...labels] });
+    },
+    [`GET repos/${REPO}/issues/7/comments?per_page=100&page=1`]: { status: 200, json: [appComment()] },
+    [`POST repos/${REPO}/issues/7/labels`]: () => {
+      labels.push(LABEL);
+      return { status: 200, json: {} };
+    },
+    [`DELETE repos/${REPO}/issues/7/labels/${encodeURIComponent(LABEL)}`]: () => {
+      labels.splice(0);
+      return { status: 200, json: {} };
+    },
+  });
+  await assert.rejects(() => reconcileReadyLabel({
+    api, graphql: async () => threadsData([]),
+    repo: REPO, prNumber: 7, appId: APP_ID, botLogin: BOT, isBot, label: LABEL,
+    log() {}, warn() {},
+  }), /HTTP 502/);
+  assert.ok(api.calls.some((c) => c.method === 'DELETE'));
+  assert.deepEqual(labels, []);
+});
+
+test('an add is removed when the Lambda is about to time out', async () => {
+  const headB = 'bbbbbbbbbb0123456789deadbeefcafebabe00000000';
+  const labels = [];
+  let posted = false;
+  const shas = [HEAD, HEAD, headB];
+  const api = fakeGitHub({
+    [`GET repos/${REPO}/pulls/7`]: () => pullJson({ sha: shas.shift() ?? headB, labels: [...labels] }),
+    [`GET repos/${REPO}/issues/7/comments?per_page=100&page=1`]: { status: 200, json: [appComment()] },
+    [`POST repos/${REPO}/issues/7/labels`]: () => {
+      posted = true;
+      labels.push(LABEL);
+      return { status: 200, json: {} };
+    },
+    [`DELETE repos/${REPO}/issues/7/labels/${encodeURIComponent(LABEL)}`]: () => {
+      labels.splice(0);
+      return { status: 200, json: {} };
+    },
+  });
+  const decision = await reconcileReadyLabel({
+    api, graphql: async () => threadsData([]),
+    repo: REPO, prNumber: 7, appId: APP_ID, botLogin: BOT, isBot, label: LABEL,
+    remainingMs: () => (posted ? 1_000 : 30_000),
+    log() {}, warn() {},
+  });
+  assert.equal(decision, 'stale-head');
+  assert.ok(api.calls.some((c) => c.method === 'DELETE'));
+  assert.deepEqual(labels, []);
 });
 
 test('operational failures reject so Lambda retries; validation errors resolve', async () => {
